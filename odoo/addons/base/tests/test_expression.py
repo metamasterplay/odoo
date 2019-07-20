@@ -6,7 +6,7 @@ import psycopg2
 from odoo.models import BaseModel
 from odoo.tests.common import TransactionCase
 from odoo.tools import mute_logger
-import odoo.osv.expression as expression
+from odoo.osv import expression
 
 
 class TestExpression(TransactionCase):
@@ -85,10 +85,10 @@ class TestExpression(TransactionCase):
             'b ab': [cids['B'], cids['AB']],
         }
         pids = {}
-        for name, cat_ids in partners_config.iteritems():
+        for name, cat_ids in partners_config.items():
             pids[name] = partners.create({'name': name, 'category_id': [(6, 0, cat_ids)]}).id
 
-        base_domain = [('id', 'in', pids.values())]
+        base_domain = [('id', 'in', list(pids.values()))]
 
         def test(op, value, expected):
             found_ids = partners.search(base_domain + [('category_id', op, value)]).ids
@@ -134,6 +134,15 @@ class TestExpression(TransactionCase):
         cats = Category.search([('id', 'child_of', categ_1.ids)])
         self.assertEqual(len(cats), 1)
 
+        # test hierarchical search in m2m with an empty list
+        cats = Category.search([('id', 'child_of', [])])
+        self.assertEqual(len(cats), 0)
+
+        # test hierarchical search in m2m with 'False' value
+        with self.assertLogs('odoo.osv.expression'):
+            cats = Category.search([('id', 'child_of', False)])
+        self.assertEqual(len(cats), 0)
+
         # test hierarchical search in m2m with parent id (list of ids)
         cats = Category.search([('id', 'parent_of', categ_1.ids)])
         self.assertEqual(len(cats), 3)
@@ -153,6 +162,15 @@ class TestExpression(TransactionCase):
         # test hierarchical search in m2m with parent ids
         cats = Category.search([('id', 'parent_of', categ_root.ids)])
         self.assertEqual(len(cats), 1)
+
+        # test hierarchical search in m2m with an empty list
+        cats = Category.search([('id', 'parent_of', [])])
+        self.assertEqual(len(cats), 0)
+
+        # test hierarchical search in m2m with 'False' value
+        with self.assertLogs('odoo.osv.expression'):
+            cats = Category.search([('id', 'parent_of', False)])
+        self.assertEqual(len(cats), 0)
 
     def test_10_equivalent_id(self):
         # equivalent queries
@@ -197,15 +215,15 @@ class TestExpression(TransactionCase):
         Partner = self.env['res.partner']
 
         # testing equality with name
-        partners = Partner.search([('parent_id', '=', 'Agrolait')])
+        partners = Partner.search([('parent_id', '=', 'Deco Addict')])
         self.assertTrue(partners)
 
         # testing the in operator with name
-        partners = Partner.search([('parent_id', 'in', 'Agrolait')])
+        partners = Partner.search([('parent_id', 'in', 'Deco Addict')])
         self.assertTrue(partners)
 
         # testing the in operator with a list of names
-        partners = Partner.search([('parent_id', 'in', ['Agrolait', 'ASUStek'])])
+        partners = Partner.search([('parent_id', 'in', ['Deco Addict', 'Wood Corner'])])
         self.assertTrue(partners)
 
         # check if many2one works with empty search list
@@ -214,9 +232,8 @@ class TestExpression(TransactionCase):
 
         # create new company with partners, and partners with no company
         company2 = self.env['res.company'].create({'name': 'Acme 2'})
-        for i in xrange(4):
+        for i in range(4):
             Partner.create({'name': 'P of Acme %s' % i, 'company_id': company2.id})
-        for i in xrange(4):
             Partner.create({'name': 'P of All %s' % i, 'company_id': False})
 
         # check if many2one works with negative empty list
@@ -528,17 +545,17 @@ class TestExpression(TransactionCase):
     def test_like_wildcards(self):
         # check that =like/=ilike expressions are working on an untranslated field
         Partner = self.env['res.partner']
-        partners = Partner.search([('name', '=like', 'A_U_TeK')])
-        self.assertTrue(len(partners) == 1, "Must match one partner (ASUSTeK)")
-        partners = Partner.search([('name', '=ilike', 'c%')])
-        self.assertTrue(len(partners) >= 1, "Must match one partner (China Export)")
+        partners = Partner.search([('name', '=like', 'W_od_C_rn_r')])
+        self.assertTrue(len(partners) == 1, "Must match one partner (Wood Corner)")
+        partners = Partner.search([('name', '=ilike', 'G%')])
+        self.assertTrue(len(partners) >= 1, "Must match one partner (Gemini Furniture)")
 
         # check that =like/=ilike expressions are working on translated field
         Country = self.env['res.country']
         countries = Country.search([('name', '=like', 'Ind__')])
         self.assertTrue(len(countries) == 1, "Must match India only")
         countries = Country.search([('name', '=ilike', 'z%')])
-        self.assertTrue(len(countries) == 3, "Must match only countries with names starting with Z (currently 3)")
+        self.assertTrue(len(countries) == 2, "Must match only countries with names starting with Z (currently 2)")
 
     def test_translate_search(self):
         Country = self.env['res.country']
@@ -557,7 +574,6 @@ class TestExpression(TransactionCase):
         # To test the 64 characters limit for table aliases in PostgreSQL
         self.patch_order('res.users', 'partner_id')
         self.patch_order('res.partner', 'commercial_partner_id,company_id,name')
-        self.patch_order('res.company', 'parent_id')
         self.env['res.users'].search([('name', '=', 'test')])
 
     @mute_logger('odoo.sql_db')
@@ -575,12 +591,12 @@ class TestExpression(TransactionCase):
             Country.search([('create_date', '=', "1970-01-01'); --")])
 
     def test_active(self):
-        # testing for many2many field with category vendor and active=False
+        # testing for many2many field with category office and active=False
         Partner = self.env['res.partner']
         vals = {
             'name': 'OpenERP Test',
             'active': False,
-            'category_id': [(6, 0, [self.ref("base.res_partner_category_1")])],
+            'category_id': [(6, 0, [self.ref("base.res_partner_category_0")])],
             'child_ids': [(0, 0, {'name': 'address of OpenERP Test', 'country_id': self.ref("base.be")})],
         }
         Partner.create(vals)
@@ -594,8 +610,8 @@ class TestExpression(TransactionCase):
     def test_lp1071710(self):
         """ Check that we can exclude translated fields (bug lp:1071710) """
         # first install french language
-        self.env['ir.translation'].load_module_terms(['base'], ['fr_FR'])
-
+        self.env['ir.translation']._load_module_terms(['base'], ['fr_FR'])
+        self.env.ref('base.res_partner_2').country_id = self.env.ref('base.be')
         # actual test
         Country = self.env['res.country']
         be = self.env.ref('base.be')
@@ -604,13 +620,54 @@ class TestExpression(TransactionCase):
 
         # indirect search via m2o
         Partner = self.env['res.partner']
-        agrolait = Partner.search([('name', '=', 'Agrolait')])
+        deco_addict = Partner.search([('name', '=', 'Deco Addict')])
 
         not_be = Partner.search([('country_id', '!=', 'Belgium')])
-        self.assertNotIn(agrolait, not_be)
+        self.assertNotIn(deco_addict, not_be)
 
         not_be = Partner.with_context(lang='fr_FR').search([('country_id', '!=', 'Belgique')])
-        self.assertNotIn(agrolait, not_be)
+        self.assertNotIn(deco_addict, not_be)
+
+    def test_or_with_implicit_and(self):
+        # Check that when using expression.OR on a list of domains with at least one
+        # implicit '&' the returned domain is the expected result.
+        # from #24038
+        d1 = [('foo', '=', 1), ('bar', '=', 1)]
+        d2 = ['&', ('foo', '=', 2), ('bar', '=', 2)]
+
+        expected = ['|', '&', ('foo', '=', 1), ('bar', '=', 1),
+                         '&', ('foo', '=', 2), ('bar', '=', 2)]
+        self.assertEqual(expression.OR([d1, d2]), expected)
+
+    def test_proper_combine_unit_leaves(self):
+        # test that unit leaves (TRUE_LEAF, FALSE_LEAF) are properly handled in specific cases
+        false = expression.FALSE_DOMAIN
+        true = expression.TRUE_DOMAIN
+        normal = [('foo', '=', 'bar')]
+        # OR with single FALSE_LEAF
+        expr = expression.OR([false])
+        self.assertEqual(expr, false)
+        # OR with multiple FALSE_LEAF
+        expr = expression.OR([false, false])
+        self.assertEqual(expr, false)
+        # OR with FALSE_LEAF and a normal leaf
+        expr = expression.OR([false, normal])
+        self.assertEqual(expr, normal)
+        # OR with AND of single TRUE_LEAF and normal leaf
+        expr = expression.OR([expression.AND([true]), normal])
+        self.assertEqual(expr, true)
+        # AND with single TRUE_LEAF
+        expr = expression.AND([true])
+        self.assertEqual(expr, true)
+        # AND with multiple TRUE_LEAF
+        expr = expression.AND([true, true])
+        self.assertEqual(expr, true)
+        # AND with TRUE_LEAF and normal leaves
+        expr = expression.AND([true, normal])
+        self.assertEqual(expr, normal)
+        # AND with OR with single FALSE_LEAF and normal leaf
+        expr = expression.AND([expression.OR([false]), normal])
+        self.assertEqual(expr, false)
 
 
 class TestAutoJoin(TransactionCase):
@@ -683,25 +740,25 @@ class TestAutoJoin(TransactionCase):
         self.assertEqual(partners, p_aa,
             "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..'): incorrect result")
         # Test produced queries
-        self.assertEqual(len(self.query_list), 3,
-            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') should produce 3 queries (1 in res_partner_bank, 2 on res_partner)")
+        self.assertEqual(len(self.query_list), 2,
+            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') should produce 2 queries (1 in res_partner_bank, 1 on res_partner)")
         sql_query = self.query_list[0].get_sql()
         self.assertIn('res_partner_bank', sql_query[0],
             "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') first query incorrect main table")
 
-        expected = "%s::text like %s" % (unaccent('"res_partner_bank"."sanitized_acc_number"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_partner_bank"."sanitized_acc_number"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') first query incorrect where condition")
-        
+
         self.assertEqual(['%' + name_test + '%'], sql_query[2],
             "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') first query incorrect parameter")
-        sql_query = self.query_list[2].get_sql()
+        sql_query = self.query_list[1].get_sql()
         self.assertIn('res_partner', sql_query[0],
-            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') third query incorrect main table")
+            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') second query incorrect main table")
         self.assertIn('"res_partner"."id" in (%s)', sql_query[1],
-            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') third query incorrect where condition")
+            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') second query incorrect where condition")
         self.assertIn(p_aa.id, sql_query[2],
-            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') third query incorrect parameter")
+            "_auto_join off: ('bank_ids.sanitized_acc_number', 'like', '..') second query incorrect parameter")
 
         # Do: cascaded one2many without _auto_join
         self._reinit_mock()
@@ -710,8 +767,8 @@ class TestAutoJoin(TransactionCase):
         self.assertEqual(partners, p_a + p_b,
             "_auto_join off: ('child_ids.bank_ids.id', 'in', [..]): incorrect result")
         # Test produced queries
-        self.assertEqual(len(self.query_list), 5,
-            "_auto_join off: ('child_ids.bank_ids.id', 'in', [..]) should produce 5 queries (1 in res_partner_bank, 4 on res_partner)")
+        self.assertEqual(len(self.query_list), 3,
+            "_auto_join off: ('child_ids.bank_ids.id', 'in', [..]) should produce 3 queries (1 in res_partner_bank, 2 on res_partner)")
 
         # Do: one2many with _auto_join
         patch_auto_join(partner_obj, 'bank_ids', True)
@@ -729,7 +786,7 @@ class TestAutoJoin(TransactionCase):
         self.assertIn('"res_partner_bank" as "res_partner__bank_ids"', sql_query[0],
             "_auto_join on: ('bank_ids.sanitized_acc_number', 'like', '..') query incorrect join")
 
-        expected = "%s::text like %s" % (unaccent('"res_partner__bank_ids"."sanitized_acc_number"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_partner__bank_ids"."sanitized_acc_number"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join on: ('bank_ids.sanitized_acc_number', 'like', '..') query incorrect where condition")
         
@@ -812,7 +869,7 @@ class TestAutoJoin(TransactionCase):
         self.assertIn('"res_country"', sql_query[0],
             "_auto_join on for state_id: ('state_id.country_id.code', 'like', '..') query 1 incorrect main table")
 
-        expected = "%s::text like %s" % (unaccent('"res_country"."code"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_country"."code"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join on for state_id: ('state_id.country_id.code', 'like', '..') query 1 incorrect where condition")
 
@@ -846,7 +903,7 @@ class TestAutoJoin(TransactionCase):
         self.assertIn('"res_country" as "res_country_state__country_id"', sql_query[0],
             "_auto_join on for country_id: ('state_id.country_id.code', 'like', '..') query 1 incorrect join")
 
-        expected = "%s::text like %s" % (unaccent('"res_country_state__country_id"."code"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_country_state__country_id"."code"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join on for country_id: ('state_id.country_id.code', 'like', '..') query 1 incorrect where condition")
         
@@ -880,7 +937,7 @@ class TestAutoJoin(TransactionCase):
         self.assertIn('"res_country" as "res_partner__state_id__country_id"', sql_query[0],
             "_auto_join on: ('state_id.country_id.code', 'like', '..') query incorrect join")
 
-        expected = "%s::text like %s" % (unaccent('"res_partner__state_id__country_id"."code"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_partner__state_id__country_id"."code"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join on: ('state_id.country_id.code', 'like', '..') query incorrect where condition")
         
@@ -910,7 +967,7 @@ class TestAutoJoin(TransactionCase):
         # Test produced queries that domains effectively present
         sql_query = self.query_list[0].get_sql()
 
-        expected = "%s::text like %s" % (unaccent('"res_partner__child_ids__bank_ids"."sanitized_acc_number"'), unaccent('%s'))
+        expected = "%s like %s" % (unaccent('"res_partner__child_ids__bank_ids"."sanitized_acc_number"::text'), unaccent('%s'))
         self.assertIn(expected, sql_query[1],
             "_auto_join on one2many with domains incorrect result")
         # TDE TODO: check first domain has a correct table name
@@ -943,7 +1000,7 @@ class TestAutoJoin(TransactionCase):
         self.assertLessEqual(p_a + p_b, partners,
             "_auto_join off: ('child_ids.state_id.country_id.code', 'like', '..') incorrect result")
         # Test produced queries
-        self.assertEqual(len(self.query_list), 5,
+        self.assertEqual(len(self.query_list), 4,
             "_auto_join off: ('child_ids.state_id.country_id.code', 'like', '..') number of queries incorrect")
 
         # Do: ('child_ids.state_id.country_id.code', 'like', '..') with _auto_join
@@ -958,3 +1015,27 @@ class TestAutoJoin(TransactionCase):
         # Test produced queries
         self.assertEqual(len(self.query_list), 1,
             "_auto_join on: ('child_ids.state_id.country_id.code', 'like', '..') number of queries incorrect")
+
+    def test_nullfields(self):
+        obj1 = self.env['res.bank'].create({'name': 'c0'})
+        obj2 = self.env['res.bank'].create({'name': 'c1', 'city': 'Ljósálfaheimr'})
+        obj3 = self.env['res.bank'].create({'name': 'c2', 'city': 'York'})
+        obj4 = self.env['res.bank'].create({'name': 'c3', 'city': 'Springfield'})
+
+        self.assertEqual(
+            self.env['res.bank'].search([
+                ('id', 'in', (obj1 | obj2 | obj3 | obj4).ids),
+                ('city', '!=', 'York'),
+            ]),
+            (obj1 | obj2 | obj4),
+            "Should have returned all banks whose city is not York"
+        )
+
+        self.assertEqual(
+            self.env['res.bank'].search([
+                ('id', 'in', (obj1 | obj2 | obj3 | obj4).ids),
+                ('city', 'not ilike', 'field'),
+            ]),
+            (obj1 | obj2 | obj3),
+            "Should have returned all banks whose city doesn't contain field"
+        )

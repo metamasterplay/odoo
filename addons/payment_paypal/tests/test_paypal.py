@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
+from odoo import fields
 from odoo.addons.payment.models.payment_acquirer import ValidationError
 from odoo.addons.payment.tests.common import PaymentAcquirerCommon
 from odoo.addons.payment_paypal.controllers.main import PaypalController
+from werkzeug import urls
+
 from odoo.tools import mute_logger
+from odoo.tests import tagged
 
 from lxml import objectify
-import urlparse
 
 
 class PaypalCommon(PaymentAcquirerCommon):
@@ -29,6 +32,7 @@ class PaypalCommon(PaymentAcquirerCommon):
         self.switch_polo = (('6331101999990016', '123'))
 
 
+@tagged('post_install', '-at_install', 'external', '-standard')
 class PaypalForm(PaypalCommon):
 
     def test_10_paypal_form_render(self):
@@ -49,7 +53,7 @@ class PaypalForm(PaypalCommon):
         form_values = {
             'cmd': '_xclick',
             'business': 'tde+paypal-facilitator@odoo.com',
-            'item_name': 'YourCompany: test_ref0',
+            'item_name': '%s: test_ref0' % (self.paypal.company_id.name),
             'item_number': 'test_ref0',
             'first_name': 'Norbert',
             'last_name': 'Buyer',
@@ -58,18 +62,23 @@ class PaypalForm(PaypalCommon):
             'address1': 'Huge Street 2/543',
             'city': 'Sin City',
             'zip': '1000',
+            'rm': '2',
             'country': 'BE',
             'email': 'norbert.buyer@example.com',
-            'return': '%s' % urlparse.urljoin(base_url, PaypalController._return_url),
-            'notify_url': '%s' % urlparse.urljoin(base_url, PaypalController._notify_url),
-            'cancel_return': '%s' % urlparse.urljoin(base_url, PaypalController._cancel_url),
+            'return': urls.url_join(base_url, PaypalController._return_url),
+            'notify_url': urls.url_join(base_url, PaypalController._notify_url),
+            'cancel_return': urls.url_join(base_url, PaypalController._cancel_url),
+            'custom': '{"return_url": "/payment/process"}',
         }
 
         # check form result
         tree = objectify.fromstring(res)
-        self.assertEqual(tree.get('action'), 'https://www.sandbox.paypal.com/cgi-bin/webscr', 'paypal: wrong form POST url')
+
+        data_set = tree.xpath("//input[@name='data_set']")
+        self.assertEqual(len(data_set), 1, 'paypal: Found %d "data_set" input instead of 1' % len(data_set))
+        self.assertEqual(data_set[0].get('data-action-url'), 'https://www.sandbox.paypal.com/cgi-bin/webscr', 'paypal: wrong form POST url')
         for form_input in tree.input:
-            if form_input.get('name') in ['submit']:
+            if form_input.get('name') in ['submit', 'data_set']:
                 continue
             self.assertEqual(
                 form_input.get('value'),
@@ -98,7 +107,10 @@ class PaypalForm(PaypalCommon):
         # check form result
         handling_found = False
         tree = objectify.fromstring(res)
-        self.assertEqual(tree.get('action'), 'https://www.sandbox.paypal.com/cgi-bin/webscr', 'paypal: wrong form POST url')
+
+        data_set = tree.xpath("//input[@name='data_set']")
+        self.assertEqual(len(data_set), 1, 'paypal: Found %d "data_set" input instead of 1' % len(data_set))
+        self.assertEqual(data_set[0].get('data-action-url'), 'https://www.sandbox.paypal.com/cgi-bin/webscr', 'paypal: wrong form POST url')
         for form_input in tree.input:
             if form_input.get('name') in ['handling']:
                 handling_found = True
@@ -115,7 +127,7 @@ class PaypalForm(PaypalCommon):
             'protection_eligibility': u'Ineligible',
             'last_name': u'Poilu',
             'txn_id': u'08D73520KX778924N',
-            'receiver_email': u'dummy',
+            'receiver_email': self.env.user.email,
             'payment_status': u'Pending',
             'payment_gross': u'',
             'tax': u'0.00',
@@ -130,7 +142,7 @@ class PaypalForm(PaypalCommon):
             'item_name': u'test_ref_2',
             'address_country': u'France',
             'charset': u'windows-1252',
-            'custom': u'',
+            'custom': u'{"return_url": "/payment/process"}',
             'notify_version': u'3.7',
             'address_name': u'Norbert Poilu',
             'pending_reason': u'multi_currency',
@@ -173,7 +185,6 @@ class PaypalForm(PaypalCommon):
         self.assertEqual(tx.state, 'pending', 'paypal: wrong state after receiving a valid pending notification')
         self.assertEqual(tx.state_message, 'multi_currency', 'paypal: wrong state message after receiving a valid pending notification')
         self.assertEqual(tx.acquirer_reference, '08D73520KX778924N', 'paypal: wrong txn_id after receiving a valid pending notification')
-        self.assertFalse(tx.date_validate, 'paypal: validation date should not be updated whenr receiving pending notification')
 
         # update tx
         tx.write({
@@ -187,4 +198,4 @@ class PaypalForm(PaypalCommon):
         # check
         self.assertEqual(tx.state, 'done', 'paypal: wrong state after receiving a valid pending notification')
         self.assertEqual(tx.acquirer_reference, '08D73520KX778924N', 'paypal: wrong txn_id after receiving a valid pending notification')
-        self.assertEqual(tx.date_validate, '2013-11-18 11:21:19', 'paypal: wrong validation date')
+        self.assertEqual(fields.Datetime.to_string(tx.date), '2013-11-18 11:21:19', 'paypal: wrong validation date')

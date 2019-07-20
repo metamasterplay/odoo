@@ -10,8 +10,9 @@ from collections import defaultdict
 import dateutil
 from dateutil.relativedelta import relativedelta
 
-from odoo import api, fields, models, SUPERUSER_ID
+from odoo import _, api, fields, models, SUPERUSER_ID
 from odoo.modules.registry import Registry
+from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT
 from odoo.tools.safe_eval import safe_eval
 
 _logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ class BaseAutomation(models.Model):
         ('on_unlink', 'On Deletion'),
         ('on_change', 'Based on Form Modification'),
         ('on_time', 'Based on Timed Condition')
-        ], string='Trigger condition', required=True, oldname="kind")
+        ], string='Trigger Condition', required=True, oldname="kind")
     trg_date_id = fields.Many2one('ir.model.fields', string='Trigger Date',
                                   help="""When should the condition be triggered.
                                   If present, will be checked by the scheduler. If empty, will be checked at creation and update.""",
@@ -57,9 +58,12 @@ class BaseAutomation(models.Model):
                                             help="When calculating a day-based timed condition, it is possible to use a calendar to compute the date based on working days.")
     filter_pre_domain = fields.Char(string='Before Update Domain',
                                     help="If present, this condition must be satisfied before the update of the record.")
-    filter_domain = fields.Char(string='Domain', help="If present, this condition must be satisfied before executing the action rule.")
+    filter_domain = fields.Char(string='Apply on', help="If present, this condition must be satisfied before executing the action rule.")
     last_run = fields.Datetime(readonly=True, copy=False)
     on_change_fields = fields.Char(string="On Change Fields Trigger", help="Comma-separated list of field names that triggers the onchange.")
+    trigger_field_ids = fields.Many2many('ir.model.fields', string='Watched fields',
+                                        help="The action will be triggered if and only if one of these fields is updated."
+                                             "If empty, all fields are watched.")
 
     # which fields have an impact on the registry
     CRITICAL_FIELDS = ['model_id', 'active', 'trigger', 'on_change_fields']
@@ -77,6 +81,19 @@ class BaseAutomation(models.Model):
         elif self.trigger == 'on_time':
             self.filter_pre_domain = False
 
+    @api.onchange('trigger', 'state')
+    def _onchange_state(self):
+        if self.trigger == 'on_change' and self.state != 'code':
+            ff = self.fields_get(['trigger', 'state'])
+            return {'warning': {
+                'title': _("Warning"),
+                'message': _("The \"%(trigger_value)s\" %(trigger_label)s can only be used with the \"%(state_value)s\" action type") % {
+                    'trigger_value': dict(ff['trigger']['selection'])['on_change'],
+                    'trigger_label': ff['trigger']['string'],
+                    'state_value': dict(ff['state']['selection'])['code'],
+                }
+            }}
+
     @api.model
     def create(self, vals):
         vals['usage'] = 'base_automation'
@@ -85,7 +102,6 @@ class BaseAutomation(models.Model):
         self._update_registry()
         return base_automation
 
-    @api.multi
     def write(self, vals):
         res = super(BaseAutomation, self).write(vals)
         if set(vals).intersection(self.CRITICAL_FIELDS):
@@ -93,7 +109,6 @@ class BaseAutomation(models.Model):
             self._update_registry()
         return res
 
-    @api.multi
     def unlink(self):
         res = super(BaseAutomation, self).unlink()
         self._update_cron()
@@ -114,7 +129,7 @@ class BaseAutomation(models.Model):
             self._cr.commit()
             self.env.reset()
             registry = Registry.new(self._cr.dbname)
-            registry.signal_registry_change()
+            registry.registry_invalidated = True
 
     def _get_actions(self, records, triggers):
         """ Return the actions of the given triggers for records' model. The
@@ -147,14 +162,17 @@ class BaseAutomation(models.Model):
             return records
 
     def _filter_post(self, records):
+        return self._filter_post_export_domain(records)[0]
+
+    def _filter_post_export_domain(self, records):
         """ Filter the records that satisfy the postcondition of action ``self``. """
         if self.filter_domain and records:
             domain = [('id', 'in', records.ids)] + safe_eval(self.filter_domain, self._get_eval_context())
-            return records.search(domain)
+            return records.search(domain), domain
         else:
-            return records
+            return records, None
 
-    def _process(self, records):
+    def _process(self, records, domain_post=None):
         """ Process action ``self`` on the ``records`` that have not been done yet. """
         # filter out the records on which self has already been done
         action_done = self._context['__action_done']
@@ -179,10 +197,38 @@ class BaseAutomation(models.Model):
         # execute server actions
         if self.action_server_id:
             for record in records:
-                ctx = {'active_model': record._name, 'active_ids': record.ids, 'active_id': record.id}
-                self.action_server_id.with_context(**ctx).run()
+                # we process the action if any watched field has been modified
+                if self._check_trigger_fields(record):
+                    ctx = {
+                        'active_model': record._name,
+                        'active_ids': record.ids,
+                        'active_id': record.id,
+                        'domain_post': domain_post,
+                    }
+                    self.action_server_id.with_context(**ctx).run()
 
-    @api.model_cr
+    def _check_trigger_fields(self, record):
+        """ Return whether any of the trigger fields has been modified on ``record``. """
+        if not self.trigger_field_ids:
+            # all fields are implicit triggers
+            return True
+
+        if not self._context.get('old_values'):
+            # this is a create: all fields are considered modified
+            return True
+
+        # Note: old_vals are in the format of read()
+        old_vals = self._context['old_values'].get(record.id, {})
+
+        def differ(name):
+            field = record._fields[name]
+            return (
+                name in old_vals and
+                field.convert_to_cache(record[name], record, validate=False) !=
+                field.convert_to_cache(old_vals[name], record, validate=False)
+            )
+        return any(differ(field.name) for field in self.trigger_field_ids)
+
     def _register_hook(self):
         """ Patch models that should trigger action rules based on creation,
             modification, deletion of records and form onchanges.
@@ -198,16 +244,16 @@ class BaseAutomation(models.Model):
 
         def make_create():
             """ Instanciate a create method that processes action rules. """
-            @api.model
-            def create(self, vals, **kw):
+            @api.model_create_multi
+            def create(self, vals_list, **kw):
                 # retrieve the action rules to possibly execute
                 actions = self.env['base.automation']._get_actions(self, ['on_create', 'on_create_or_write'])
                 # call original method
-                record = create.origin(self.with_env(actions.env), vals, **kw)
+                records = create.origin(self.with_env(actions.env), vals_list, **kw)
                 # check postconditions, and execute actions on the records that satisfy them
                 for action in actions.with_context(old_values=None):
-                    action._process(action._filter_post(record))
-                return record.with_env(self.env)
+                    action._process(action._filter_post(records))
+                return records.with_env(self.env)
 
             return create
 
@@ -217,7 +263,6 @@ class BaseAutomation(models.Model):
             # Note: we patch method _write() instead of write() in order to
             # catch updates made by field recomputations.
             #
-            @api.multi
             def _write(self, vals, **kw):
                 # retrieve the action rules to possibly execute
                 actions = self.env['base.automation']._get_actions(self, ['on_write', 'on_create_or_write'])
@@ -227,20 +272,20 @@ class BaseAutomation(models.Model):
                 # read old values before the update
                 old_values = {
                     old_vals.pop('id'): old_vals
-                    for old_vals in records.read(list(vals))
+                    for old_vals in (records.read(list(vals)) if vals else [])
                 }
                 # call original method
                 _write.origin(records, vals, **kw)
                 # check postconditions, and execute actions on the records that satisfy them
                 for action in actions.with_context(old_values=old_values):
-                    action._process(action._filter_post(pre[action]))
+                    records, domain_post = action._filter_post_export_domain(pre[action])
+                    action._process(records, domain_post=domain_post)
                 return True
 
             return _write
 
         def make_unlink():
             """ Instanciate an unlink method that processes action rules. """
-            @api.multi
             def unlink(self, **kwargs):
                 # retrieve the action rules to possibly execute
                 actions = self.env['base.automation']._get_actions(self, ['on_unlink'])
@@ -263,7 +308,7 @@ class BaseAutomation(models.Model):
                 if res:
                     if 'value' in res:
                         res['value'].pop('id', None)
-                        self.update({key: val for key, val in res['value'].iteritems() if key in self._fields})
+                        self.update({key: val for key, val in res['value'].items() if key in self._fields})
                     if 'domain' in res:
                         result.setdefault('domain', {}).update(res['domain'])
                     if 'warning' in res:
@@ -281,7 +326,15 @@ class BaseAutomation(models.Model):
 
         # retrieve all actions, and patch their corresponding model
         for action_rule in self.with_context({}).search([]):
-            Model = self.env[action_rule.model_name]
+            Model = self.env.get(action_rule.model_name)
+
+            # Do not crash if the model of the base_action_rule was uninstalled
+            if Model is None:
+                _logger.warning("Action rule with ID %d depends on model %s" %
+                                (action_rule.id,
+                                 action_rule.model_name))
+                continue
+
             if action_rule.trigger == 'on_create':
                 patch(Model, 'create', make_create())
 
@@ -306,7 +359,7 @@ class BaseAutomation(models.Model):
         if action.trg_date_calendar_id and action.trg_date_range_type == 'day':
             return action.trg_date_calendar_id.plan_days(
                 action.trg_date_range,
-                day_date=fields.Datetime.from_string(record_dt),
+                fields.Datetime.from_string(record_dt),
                 compute_leaves=True,
             )
         else:
@@ -350,7 +403,7 @@ class BaseAutomation(models.Model):
                     except Exception:
                         _logger.error(traceback.format_exc())
 
-            action.write({'last_run': fields.Datetime.now()})
+            action.write({'last_run': now.strftime(DEFAULT_SERVER_DATETIME_FORMAT)})
 
             if automatic:
                 # auto-commit for batch processing

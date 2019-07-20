@@ -2,7 +2,8 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 import hashlib
-import urlparse
+
+from werkzeug import urls
 
 from odoo import api, fields, models, _
 from odoo.addons.payment.models.payment_acquirer import ValidationError
@@ -48,10 +49,9 @@ class PaymentAcquirerPayumoney(models.Model):
             sign = ''.join('%s|' % (values.get(k) or '') for k in keys)
             sign = self.payumoney_merchant_salt + sign + self.payumoney_merchant_key
 
-        shasign = hashlib.sha512(sign).hexdigest()
+        shasign = hashlib.sha512(sign.encode('utf-8')).hexdigest()
         return shasign
 
-    @api.multi
     def payumoney_form_generate_values(self, values):
         self.ensure_one()
         base_url = self.env['ir.config_parameter'].sudo().get_param('web.base.url')
@@ -64,16 +64,15 @@ class PaymentAcquirerPayumoney(models.Model):
                                 email=values.get('partner_email'),
                                 phone=values.get('partner_phone'),
                                 service_provider='payu_paisa',
-                                surl='%s' % urlparse.urljoin(base_url, '/payment/payumoney/return'),
-                                furl='%s' % urlparse.urljoin(base_url, '/payment/payumoney/error'),
-                                curl='%s' % urlparse.urljoin(base_url, '/payment/payumoney/cancel')
+                                surl=urls.url_join(base_url, '/payment/payumoney/return'),
+                                furl=urls.url_join(base_url, '/payment/payumoney/error'),
+                                curl=urls.url_join(base_url, '/payment/payumoney/cancel')
                                 )
 
         payumoney_values['udf1'] = payumoney_values.pop('return_url', '/')
         payumoney_values['hash'] = self._payumoney_generate_sign('in', payumoney_values)
         return payumoney_values
 
-    @api.multi
     def payumoney_get_form_action_url(self):
         self.ensure_one()
         return self._get_payumoney_urls(self.environment)['payumoney_form_url']
@@ -107,7 +106,6 @@ class PaymentTransactionPayumoney(models.Model):
             raise ValidationError(_('PayUmoney: invalid shasign, received %s, computed %s, for data %s') % (shasign, shasign_check, data))
         return transaction
 
-    @api.multi
     def _payumoney_form_get_invalid_parameters(self, data):
         invalid_parameters = []
 
@@ -121,34 +119,16 @@ class PaymentTransactionPayumoney(models.Model):
 
         return invalid_parameters
 
-    @api.multi
     def _payumoney_form_validate(self, data):
         status = data.get('status')
-        transaction_status = {
-            'success': {
-                'state': 'done',
-                'acquirer_reference': data.get('payuMoneyId'),
-                'date_validate': fields.Datetime.now(),
-            },
-            'pending': {
-                'state': 'pending',
-                'acquirer_reference': data.get('payuMoneyId'),
-                'date_validate': fields.Datetime.now(),
-            },
-            'failure': {
-                'state': 'cancel',
-                'acquirer_reference': data.get('payuMoneyId'),
-                'date_validate': fields.Datetime.now(),
-            },
-            'error': {
-                'state': 'error',
-                'state_message': data.get('error_Message') or _('PayUmoney: feedback error'),
-                'acquirer_reference': data.get('payuMoneyId'),
-                'date_validate': fields.Datetime.now(),
-            }
-        }
-        vals = transaction_status.get(status, False)
-        if not vals:
-            vals = transaction_status['error']
-            _logger.info(vals['state_message'])
-        return self.write(vals)
+        result = self.write({
+            'acquirer_reference': data.get('payuMoneyId'),
+            'date': fields.Datetime.now(),
+        })
+        if status == 'success':
+            self._set_transaction_done()
+        elif status != 'pending':
+            self._set_transaction_cancel()
+        else:
+            self._set_transaction_pending()
+        return result

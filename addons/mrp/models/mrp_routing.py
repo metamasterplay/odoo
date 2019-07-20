@@ -9,7 +9,7 @@ class MrpRouting(models.Model):
     _name = 'mrp.routing'
     _description = 'Routings'
 
-    name = fields.Char('Routing Name', required=True)
+    name = fields.Char('Routing', required=True)
     active = fields.Boolean(
         'Active', default=True,
         help="If the active field is set to False, it will allow you to hide the routing without removing it.")
@@ -20,14 +20,9 @@ class MrpRouting(models.Model):
     operation_ids = fields.One2many(
         'mrp.routing.workcenter', 'routing_id', 'Operations',
         copy=True, oldname='workcenter_lines')
-    location_id = fields.Many2one(
-        'stock.location', 'Production Location',
-        help="Keep empty if you produce at the location where you find the raw materials."
-             "Set a location if you produce at a fixed location. This can be a partner location "
-             "if you subcontract the manufacturing operations.")
     company_id = fields.Many2one(
         'res.company', 'Company',
-        default=lambda self: self.env['res.company']._company_default_get('mrp.routing'))
+        default=lambda self: self.env.company)
 
     @api.model
     def create(self, vals):
@@ -49,8 +44,8 @@ class MrpRoutingWorkcenter(models.Model):
     routing_id = fields.Many2one(
         'mrp.routing', 'Parent Routing',
         index=True, ondelete='cascade', required=True,
-        help="The routing contains all the Work Centers used and for how long. This will create work orders afterwards"
-        "which alters the execution of the manufacturing order. ")
+        help="The routing contains all the Work Centers used and for how long. This will create work orders afterwards "
+        "which alters the execution of the manufacturing order.")
     note = fields.Text('Description')
     company_id = fields.Many2one(
         'res.company', 'Company',
@@ -59,7 +54,7 @@ class MrpRoutingWorkcenter(models.Model):
     time_mode = fields.Selection([
         ('auto', 'Compute based on real time'),
         ('manual', 'Set duration manually')], string='Duration Computation',
-        default='auto')
+        default='manual')
     time_mode_batch = fields.Integer('Based on', default=10)
     time_cycle_manual = fields.Float(
         'Manual Duration', default=60,
@@ -69,12 +64,11 @@ class MrpRoutingWorkcenter(models.Model):
     batch = fields.Selection([
         ('no',  'Once all products are processed'),
         ('yes', 'Once a minimum number of products is processed')], string='Next Operation',
-        help="""Will determine if the next work order will be planned after the previous one or after the first Quantity To Process of the previous one.""",
+        help="Set 'no' to schedule the next work order after the previous one. Set 'yes' to produce after the quantity set in 'Quantity To Process' has been produced.",
         default='no', required=True)
     batch_size = fields.Float('Quantity to Process', default=1.0)
     workorder_ids = fields.One2many('mrp.workorder', 'operation_id', string="Work Orders")
 
-    @api.multi
     @api.depends('time_cycle_manual', 'time_mode', 'workorder_ids')
     def _compute_time_cycle(self):
         manual_ops = self.filtered(lambda operation: operation.time_mode == 'manual')
@@ -91,7 +85,6 @@ class MrpRoutingWorkcenter(models.Model):
             else:
                 operation.time_cycle = operation.time_cycle_manual
 
-    @api.multi
     def _compute_workorder_count(self):
         data = self.env['mrp.workorder'].read_group([
             ('operation_id', 'in', self.ids),

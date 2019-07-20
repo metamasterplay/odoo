@@ -32,29 +32,29 @@ odoo.define('web.AbstractField', function (require) {
 
 var field_utils = require('web.field_utils');
 var Widget = require('web.Widget');
-var Domain = require('web.Domain');
 
 var AbstractField = Widget.extend({
-    className: 'o_field_widget',
     events: {
         'keydown': '_onKeydown',
     },
+    custom_events: {
+        navigation_move: '_onNavigationMove',
+    },
+
     /**
-     * if this flag is set to true, the rest of the web client will assume that
-     * it is not editable.  For example, the list view in editable mode will
-     * skip the widget when pressing tab
-     */
-    readonly: false,
+    * An object representing fields to be fetched by the model eventhough not present in the view
+    * This object contains "field name" as key and an object as value.
+    * That value object must contain the key "type"
+    * see FieldBinaryImage for an example.
+    */
+    fieldDependencies: {},
+
     /**
      * If this flag is set to true, the field widget will be reset on every
      * change which is made in the view (if the view supports it). This is
      * currently a form view feature.
      */
     resetOnAnyFieldChange: false,
-    /**
-     * if true, the widget will replace a cell in an editable list view
-     */
-    replace_element: false,
     /**
      * If this flag is given a string, the related BasicModel will be used to
      * initialize specialData the field might need. This data will be available
@@ -65,20 +65,32 @@ var AbstractField = Widget.extend({
     specialData: false,
     /**
      * to override to indicate which field types are supported by the widget
+     *
+     * @type Array<String>
      */
     supportedFieldTypes: [],
 
+    /**
+     * To override to give a user friendly name to the widget.
+     *
+     * @type <string>
+     */
+    description: "",
+    /**
+     * Currently only used in list view.
+     * If this flag is set to true, the list column name will be empty.
+     */
+    noLabel: false,
     /**
      * Abstract field class
      *
      * @constructor
      * @param {Widget} parent
      * @param {string} name The field name defined in the model
-     * @param {Object} record A record object (result of the get method of a basic model)
+     * @param {Object} record A record object (result of the get method of
+     *   a basic model)
      * @param {Object} [options]
      * @param {string} [options.mode=readonly] should be 'readonly' or 'edit'
-     * @param {string} [options.required=false]
-     * @param {string} [options.idForLabel]
      */
     init: function (parent, name, record, options) {
         this._super(parent);
@@ -101,10 +113,10 @@ var AbstractField = Widget.extend({
         // the 'attrs' property contains the attributes of the xml 'field' tag,
         // the inner views...
         var fieldsInfo = record.fieldsInfo[this.viewType];
-        this.attrs = fieldsInfo && fieldsInfo[name] || {};
+        this.attrs = options.attrs || (fieldsInfo && fieldsInfo[name]) || {};
 
-        // modifiers
-        this.modifiers =  JSON.parse(this.attrs.modifiers || "{}");
+        // the 'additionalContext' property contains the attributes to pass through the context.
+        this.additionalContext = options.additionalContext || {};
 
         // this property tracks the current (parsed if needed) value of the field.
         // Note that we don't use an event system anymore, using this.get('value')
@@ -153,30 +165,43 @@ var AbstractField = Widget.extend({
         // a string.
         this._isValid = true;
 
-        // the 'required' flag is basically only needed to determine if the widget
-        // is in a valid state (not valid if empty and required)
-        this.required = options.required || this.field.required;
-
-        // the 'idForLabel' is the (html) id that should be set to the relevent
-        // dom entity.  If done correctly, clicking on the corresponding label
-        // (in form view) will focus and select the value.
-        this.idForLabel = options.idForLabel;
-
         // this is the last value that was set by the user, unparsed.  This is
         // used to avoid setting the value twice in a row with the exact value.
         this.lastSetValue = undefined;
+
+        // formatType is used to determine which format (and parse) functions
+        // to call to format the field's value to insert into the DOM (typically
+        // put into a span or an input), and to parse the value from the input
+        // to send it to the server. These functions are chosen according to
+        // the 'widget' attrs if is is given, and if it is a valid key, with a
+        // fallback on the field type, ensuring that the value is formatted and
+        // displayed according to the choosen widget, if any.
+        this.formatType = this.attrs.widget in field_utils.format ?
+                            this.attrs.widget :
+                            this.field.type;
+        // formatOptions (resp. parseOptions) is a dict of options passed to
+        // calls to the format (resp. parse) function.
+        this.formatOptions = {};
+        this.parseOptions = {};
+
+        // if we add decorations, we need to reevaluate the field whenever any
+        // value from the record is changed
+        if (this.attrs.decorations) {
+            this.resetOnAnyFieldChange = true;
+        }
     },
     /**
      * When a field widget is appended to the DOM, its start method is called,
      * and will automatically call render. Most widgets should not override this.
      *
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     start: function () {
         var self = this;
         return this._super.apply(this, arguments).then(function () {
-            self._render();
             self.$el.attr('name', self.name);
+            self.$el.addClass('o_field_widget');
+            return self._render();
         });
     },
 
@@ -185,21 +210,62 @@ var AbstractField = Widget.extend({
     //--------------------------------------------------------------------------
 
     /**
-     * Right now, this function is only used in editable list view when the user
-     * select a cell.  The corresponding widget will be activated, which in general
-     * means that the input text will be focused and selected
+     * Activates the field widget. By default, activation means focusing and
+     * selecting (if possible) the associated focusable element. The selecting
+     * part can be disabled.  In that case, note that the focused input/textarea
+     * will have the cursor at the very end.
+     *
+     * @param {Object} [options]
+     * @param {boolean} [options.noselect=false] if false and the input
+     *   is of type text or textarea, the content will also be selected
+     * @param {Event} [options.event] the event which fired this activation
+     * @returns {boolean} true if the widget was activated, false if the
+     *                    focusable element was not found or invisible
      */
-    activate: function () {
+    activate: function (options) {
+        if (this.isFocusable()) {
+            var $focusable = this.getFocusableElement();
+            $focusable.focus();
+            if ($focusable.is('input[type="text"], textarea')) {
+                $focusable[0].selectionStart = $focusable[0].selectionEnd = $focusable[0].value.length;
+                if (options && !options.noselect) {
+                    $focusable.select();
+                }
+            }
+            return true;
+        }
+        return false;
     },
     /**
      * This function should be implemented by widgets that are not able to
      * notify their environment when their value changes (maybe because their
-     * are not aware of the changes). It is called before saving, and should
-     * call _setValue() to notify the environment if the value changed.
+     * are not aware of the changes) or that may have a value in a temporary
+     * state (maybe because some action should be performed to validate it
+     * before notifying it). This is typically called before trying to save the
+     * widget's value, so it should call _setValue() to notify the environment
+     * if the value changed but was not notified.
      *
      * @abstract
+     * @returns {Promise|undefined}
      */
-    commitChanges: function () {
+    commitChanges: function () {},
+    /**
+     * Returns the main field's DOM element (jQuery form) which can be focused
+     * by the browser.
+     *
+     * @returns {jQuery} main focusable element inside the widget
+     */
+    getFocusableElement: function () {
+        return $();
+    },
+    /**
+     * Returns true iff the widget has a visible element that can take the focus
+     *
+     * @returns {boolean}
+     */
+    isFocusable: function () {
+        var $focusable = this.getFocusableElement();
+        return $focusable.length && $focusable.is(':visible');
     },
     /**
      * this method is used to determine if the field value is set to a meaningful
@@ -211,23 +277,17 @@ var AbstractField = Widget.extend({
         return !!this.value;
     },
     /**
-     * a field widget is valid if its value is valid and if there is a value when
-     * it is required.  This is checked before saving a record, by the form view.
+     * A field widget is valid if it was checked as valid the last time its
+     * value was changed by the user. This is checked before saving a record, by
+     * the view.
      *
-     * Note: the return value may be a boolean.  It is necessary for some fields
-     * (x2many) to sometimes ask confirmation to the user if the current dirty
-     * invalid line can be discarded.  This is an asynchronous operation, so we
-     * need the expressivity of something like a deferred.
+     * Note: this is the responsability of the view to check that required
+     * fields have a set value.
      *
-     * @returns {boolean|Deferred} true/false if the widget is valid, or a
-     *   deferred which resolves to true/false if the widget is valid or not
+     * @returns {boolean} true/false if the widget is valid
      */
     isValid: function () {
-        var is_required = this.required;
-        if ('required' in this.modifiers) {
-            is_required = new Domain(this.modifiers.required).compute(this.recordData);
-        }
-        return this._isValid && !(is_required && !this.isSet());
+        return this._isValid;
     },
     /**
      * this method is supposed to be called from the outside of field widgets.
@@ -240,39 +300,103 @@ var AbstractField = Widget.extend({
      *   is optional, and may be used by a widget to share information from the
      *   moment a field change event is triggered to the moment a reset
      *   operation is applied.
-     * @returns {Deferred} A Deferred, which resolves when the widget rendering
+     * @returns {Promise} A promise, which resolves when the widget rendering
      *   is complete
      */
     reset: function (record, event) {
         this._reset(record, event);
-        return this._render();
+        return this._render() || Promise.resolve();
     },
+    /**
+     * Remove the invalid class on a field
+     */
+    removeInvalidClass: function () {
+        this.$el.removeClass('o_field_invalid');
+        this.$el.removeAttr('aria-invalid');
+    },
+    /**
+     * Sets the given id on the focusable element of the field and as 'for'
+     * attribute of potential internal labels.
+     *
+     * @param {string} id
+     */
+    setIDForLabel: function (id) {
+        this.getFocusableElement().attr('id', id);
+    },
+    /**
+     * add the invalid class on a field
+     */
+    setInvalidClass: function () {
+        this.$el.addClass('o_field_invalid');
+        this.$el.attr('aria-invalid', 'true');
+    },
+    /**
+     * Update the modifiers with the newest value.
+     * Now this.attrs.modifiersValue can be used consistantly even with
+     * conditional modifiers inside field widgets, and without needing new
+     * events or synchronization between the widgets, renderer and controller
+     *
+     * @param {Object | null} modifiers  the updated modifiers
+     * @override
+     */
+    updateModifiersValue: function(modifiers) {
+        this.attrs.modifiersValue = modifiers || {};
+    },
+
 
     //--------------------------------------------------------------------------
     // Private
     //--------------------------------------------------------------------------
 
     /**
-     * convert the value from the field to a string representation
+     * Apply field decorations (only if field-specific decorations have been
+     * defined in an attribute).
+     *
+     * @private
+     */
+    _applyDecorations: function () {
+        var self = this;
+        this.attrs.decorations.forEach(function (dec) {
+            var isToggled = py.PY_isTrue(
+                py.evaluate(dec.expression, self.record.evalContext)
+            );
+            self.$el.toggleClass(dec.className, isToggled);
+        });
+    },
+    /**
+     * Converts the value from the field to a string representation.
      *
      * @private
      * @param {any} value (from the field type)
      * @returns {string}
      */
     _formatValue: function (value) {
-        var options = _.extend({}, this.nodeOptions, { data: this.recordData });
-        return field_utils.format[this.field.type](value, this.field, options);
+        var options = _.extend({}, this.nodeOptions, { data: this.recordData }, this.formatOptions);
+        return field_utils.format[this.formatType](value, this.field, options);
     },
     /**
-     * convert a string representation to a valid value, depending on the field
-     * type.
+     * This method check if a value is the same as the current value of the
+     * field.  For example, a fieldDate widget might want to use the moment
+     * specific value isSame instead of ===.
+     *
+     * This method is used by the _setValue method.
+     *
+     * @private
+     * @param {any} value
+     * @returns {boolean}
+     */
+    _isSameValue: function (value) {
+        return this.value === value;
+    },
+    /**
+     * Converts a string representation to a valid value.
      *
      * @private
      * @param {string} value
      * @returns {any}
      */
     _parseValue: function (value) {
-        return field_utils.parse[this.field.type](value, this.field);
+        return field_utils.parse[this.formatType](value, this.field, this.parseOptions);
     },
     /**
      * main rendering function.  Override this if your widget has the same render
@@ -282,15 +406,12 @@ var AbstractField = Widget.extend({
      * synchronous.
      *
      * @private
-     * @returns {Deferred}
+     * @returns {Promise|undefined}
      */
     _render: function () {
-        var is_required = this.required;
-        if ('required' in this.modifiers) {
-            is_required = new Domain(this.modifiers.required).compute(this.recordData);
+        if (this.attrs.decorations) {
+            this._applyDecorations();
         }
-        this.$el.toggleClass('o_form_required', is_required);
-
         if (this.mode === 'edit') {
             return this._renderEdit();
         } else if (this.mode === 'readonly') {
@@ -302,7 +423,7 @@ var AbstractField = Widget.extend({
      * concrete widget.
      *
      * @private
-     * @returns {Deferred}
+     * @returns {Promise|undefined}
      */
     _renderEdit: function () {
     },
@@ -311,7 +432,7 @@ var AbstractField = Widget.extend({
      * the concrete widget.
      *
      * @private
-     * @returns {Deferred}
+     * @returns {Promise|undefined}
      */
     _renderReadonly: function () {
     },
@@ -336,25 +457,50 @@ var AbstractField = Widget.extend({
      *
      * @private
      * @param {any} value
+     * @param {Object} [options]
+     * @param {boolean} [options.doNotSetDirty=false] if true, the basic model
+     *   will not consider that this field is dirty, even though it was changed.
+     *   Please do not use this flag unless you really need it.  Our only use
+     *   case is currently the pad widget, which does a _setValue in the
+     *   renderEdit method.
+     * @param {boolean} [options.notifyChange=true] if false, the basic model
+     *   will not notify and not trigger the onchange, even though it was changed.
+     * @param {boolean} [options.forceChange=false] if true, the change event will be
+     *   triggered even if the new value is the same as the old one
+     * @returns {Promise}
      */
-    _setValue: function (value) {
+    _setValue: function (value, options) {
         // we try to avoid doing useless work, if the value given has not
         // changed.  Note that we compare the unparsed values.
-        if (this.lastSetValue === value || (value !== false && value === this.value)) {
-            return;
+        if (this.lastSetValue === value || (this.value === false && value === '')) {
+            return Promise.resolve();
         }
         this.lastSetValue = value;
         try {
             value = this._parseValue(value);
             this._isValid = true;
-        } catch(e) {
+        } catch (e) {
             this._isValid = false;
+            this.trigger_up('set_dirty', {dataPointID: this.dataPointID});
+            return Promise.reject({message: "Value set is not valid"});
         }
-        var changes = {};
-        changes[this.name] = value;
-        this.trigger_up('field_changed', {
-            dataPointID: this.dataPointID,
-            changes: changes,
+        if (!(options && options.forceChange) && this._isSameValue(value)) {
+            return Promise.resolve();
+        }
+        var self = this;
+        return new Promise(function (resolve, reject) {
+            var changes = {};
+            changes[self.name] = value;
+            self.trigger_up('field_changed', {
+                dataPointID: self.dataPointID,
+                changes: changes,
+                viewType: self.viewType,
+                doNotSetDirty: options && options.doNotSetDirty,
+                notifyChange: !options || options.notifyChange !== false,
+                allowWarning: options && options.allowWarning,
+                onSuccess: resolve,
+                onFailure: reject,
+            });
         });
     },
 
@@ -363,20 +509,64 @@ var AbstractField = Widget.extend({
     //--------------------------------------------------------------------------
 
     /**
-     * might be controversial: intercept the tab key, to allow the editable list
-     * view to control where the focus is.
+     * Intercepts navigation keyboard events to prevent their default behavior
+     * and notifies the view so that it can handle it its own way.
+     *
+     * Note: the navigation keyboard events are stopped so that potential parent
+     * abstract field does not trigger the navigation_move event a second time.
+     * However, this might be controversial, we might wanna let the event
+     * continue its propagation and flag it to say that navigation has already
+     * been handled (TODO ?).
      *
      * @private
-     * @param {KeyEvent} event
+     * @param {KeyEvent} ev
      */
-    _onKeydown: function (event) {
-        if (event.which === $.ui.keyCode.TAB) {
-            // the event needs to be stopped, to prevent other field widgets
-            // to retrigger a move event
-            event.stopPropagation();
-            this.trigger_up(event.shiftKey ? 'move_previous' : 'move_next');
-            event.preventDefault();
+    _onKeydown: function (ev) {
+        switch (ev.which) {
+            case $.ui.keyCode.TAB:
+                var event = this.trigger_up('navigation_move', {
+                    direction: ev.shiftKey ? 'previous' : 'next',
+                });
+                if (event.is_stopped()) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                }
+                break;
+            case $.ui.keyCode.ENTER:
+                ev.stopPropagation();
+                this.trigger_up('navigation_move', {direction: 'next_line'});
+                break;
+            case $.ui.keyCode.ESCAPE:
+                this.trigger_up('navigation_move', {direction: 'cancel', originalEvent: ev});
+                break;
+            case $.ui.keyCode.UP:
+                ev.stopPropagation();
+                this.trigger_up('navigation_move', {direction: 'up'});
+                break;
+            case $.ui.keyCode.RIGHT:
+                ev.stopPropagation();
+                this.trigger_up('navigation_move', {direction: 'right'});
+                break;
+            case $.ui.keyCode.DOWN:
+                ev.stopPropagation();
+                this.trigger_up('navigation_move', {direction: 'down'});
+                break;
+            case $.ui.keyCode.LEFT:
+                ev.stopPropagation();
+                this.trigger_up('navigation_move', {direction: 'left'});
+                break;
         }
+    },
+    /**
+     * Updates the target data value with the current AbstractField instance.
+     * This allows to consider the parent field in case of nested fields. The
+     * field which triggered the event is still accessible through ev.target.
+     *
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onNavigationMove: function (ev) {
+        ev.data.target = this;
     },
 });
 

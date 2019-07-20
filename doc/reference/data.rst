@@ -58,7 +58,7 @@ following attributes:
     Requires an :term:`external id`, defaults to ``True``.
 
 ``field``
-'''''''''
+----------
 
 Each record can be composed of ``field`` tags, defining values to set when
 creating the record. A ``record`` with no ``field`` will use all default
@@ -218,10 +218,10 @@ section of the view, and allowing a few *optional* attributes:
 ``report``
 ----------
 
-Creates a ``ir.actions.report.xml`` record with a few default values.
+Creates a ``ir.actions.report`` record with a few default values.
 
 Mostly just proxies attributes to the corresponding fields on
-``ir.actions.report.xml``, but also automatically creates the item in the
+``ir.actions.report``, but also automatically creates the item in the
 :guilabel:`More` menu of the report's ``model``.
 
 .. ignored url, act_window and ir_set
@@ -243,14 +243,14 @@ For this case, data files can also use csv_, this is often the case for
 Here's the first lines of the data file defining US states
 ``res.country.state.csv``
 
-.. literalinclude:: ../../odoo/addons/base/res/res.country.state.csv
+.. literalinclude:: ../../odoo/addons/base/data/res.country.state.csv
     :language: text
     :lines: 1-15
 
 rendered in a more readable format:
 
 .. csv-table::
-    :file: ../../odoo/addons/base/res/res.country.state.csv
+    :file: ../../odoo/addons/base/data/res.country.state.csv
     :header-rows: 1
     :class: table-striped table-hover table-condensed
 

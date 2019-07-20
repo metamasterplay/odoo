@@ -10,10 +10,10 @@ import time
 import odoo
 from odoo.exceptions import UserError, ValidationError, QWebException
 from odoo.models import check_method_name
-from odoo.tools.translate import translate
+from odoo.tools.translate import translate, translate_sql_constraint
 from odoo.tools.translate import _
 
-import security
+from . import security
 
 _logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ PG_CONCURRENCY_ERRORS_TO_RETRY = (errorcodes.LOCK_NOT_AVAILABLE, errorcodes.SERI
 MAX_TRIES_ON_CONCURRENCY_FAILURE = 5
 
 def dispatch(method, params):
-    (db, uid, passwd ) = params[0:3]
+    (db, uid, passwd ) = params[0], int(params[1]), params[2]
 
     # set uid tracker - cleaned up at the WSGI
     # dispatching phase in odoo.service.wsgi_server.application
@@ -35,8 +35,8 @@ def dispatch(method, params):
     security.check(db,uid,passwd)
     registry = odoo.registry(db).check_signaling()
     fn = globals()[method]
-    res = fn(db, uid, *params)
-    registry.signal_caches_change()
+    with registry.manage_changes():
+        res = fn(db, uid, *params)
     return res
 
 def check(f):
@@ -57,14 +57,15 @@ def check(f):
             elif isinstance(kwargs, dict):
                 if 'context' in kwargs:
                     ctx = kwargs['context']
-                elif 'kwargs' in kwargs:
+                elif 'kwargs' in kwargs and kwargs['kwargs'].get('context'):
                     # http entry points such as call_kw()
                     ctx = kwargs['kwargs'].get('context')
-
-
-            uid = 1
-            if args and isinstance(args[0], (long, int)):
-                uid = args[0]
+                else:
+                    try:
+                        from odoo.http import request
+                        ctx = request.env.context
+                    except Exception:
+                        pass
 
             lang = ctx and ctx.get('lang')
             if not (lang or hasattr(src, '__call__')):
@@ -72,41 +73,13 @@ def check(f):
 
             # We open a *new* cursor here, one reason is that failed SQL
             # queries (as in IntegrityError) will invalidate the current one.
-            cr = False
-
-            if hasattr(src, '__call__'):
-                # callable. We need to find the right parameters to call
-                # the  orm._sql_message(self, cr, uid, ids, context) function,
-                # or we skip..
-                # our signature is f(registry, dbname [,uid, obj, method, args])
-                try:
-                    if args and len(args) > 1:
-                        # TODO self doesn't exist, but was already wrong before (it was not a registry but just the object_service.
-                        obj = self.get(args[1])
-                        if len(args) > 3 and isinstance(args[3], (long, int, list)):
-                            ids = args[3]
-                        else:
-                            ids = []
-                    cr = odoo.sql_db.db_connect(dbname).cursor()
-                    return src(obj, cr, uid, ids, context=(ctx or {}))
-                except Exception:
-                    pass
-                finally:
-                    if cr: cr.close()
-
-                return False # so that the original SQL error will
-                             # be returned, it is the best we have.
-
-            try:
-                cr = odoo.sql_db.db_connect(dbname).cursor()
-                res = translate(cr, name=False, source_type=ttype,
-                                lang=lang, source=src)
-                if res:
-                    return res
+            with odoo.sql_db.db_connect(dbname).cursor() as cr:
+                if ttype == 'sql_constraint':
+                    res = translate_sql_constraint(cr, key=key, lang=lang)
                 else:
-                    return src
-            finally:
-                if cr: cr.close()
+                    res = translate(cr, name=False, source_type=ttype,
+                                    lang=lang, source=src)
+                return res or src
 
         def _(src):
             return tr(src, 'code')
@@ -136,31 +109,49 @@ def check(f):
                 time.sleep(wait_time)
             except IntegrityError as inst:
                 registry = odoo.registry(dbname)
-                for key in registry._sql_error.keys():
-                    if key in inst[0]:
-                        raise ValidationError(tr(registry._sql_error[key], 'sql_constraint') or inst[0])
+                key = inst.diag.constraint_name
+                if key in registry._sql_constraints:
+                    raise ValidationError(tr(key, 'sql_constraint') or inst.pgerror)
                 if inst.pgcode in (errorcodes.NOT_NULL_VIOLATION, errorcodes.FOREIGN_KEY_VIOLATION, errorcodes.RESTRICT_VIOLATION):
-                    msg = _('The operation cannot be completed, probably due to the following:\n- deletion: you may be trying to delete a record while other records still reference it\n- creation/update: a mandatory field is not correctly set')
+                    msg = _('The operation cannot be completed:')
                     _logger.debug("IntegrityError", exc_info=True)
                     try:
-                        errortxt = inst.pgerror.replace('«','"').replace('»','"')
-                        if '"public".' in errortxt:
-                            context = errortxt.split('"public".')[1]
-                            model_name = table = context.split('"')[1]
-                        else:
-                            last_quote_end = errortxt.rfind('"')
-                            last_quote_begin = errortxt.rfind('"', 0, last_quote_end)
-                            model_name = table = errortxt[last_quote_begin+1:last_quote_end].strip()
-                        model = table.replace("_",".")
-                        if model in registry:
-                            model_class = registry[model]
-                            model_name = model_class._description or model_class._name
-                        msg += _('\n\n[object with reference: %s - %s]') % (model_name, model)
+                        # Get corresponding model and field
+                        model = field = None
+                        for name, rclass in registry.items():
+                            if inst.diag.table_name == rclass._table:
+                                model = rclass
+                                field = model._fields.get(inst.diag.column_name)
+                                break
+                        if inst.pgcode == errorcodes.NOT_NULL_VIOLATION:
+                            # This is raised when a field is set with `required=True`. 2 cases:
+                            # - Create/update: a mandatory field is not set.
+                            # - Delete: another model has a not nullable using the deleted record.
+                            msg += '\n'
+                            msg += _(
+                                '- Create/update: a mandatory field is not set.\n'
+                                '- Delete: another model requires the record being deleted. If possible, archive it instead.'
+                            )
+                            if model:
+                                msg += '\n\n{} {} ({}), {} {} ({})'.format(
+                                    _('Model:'), model._description, model._name,
+                                    _('Field:'), field.string if field else _('Unknown'), field.name if field else _('Unknown'),
+                                )
+                        elif inst.pgcode == errorcodes.FOREIGN_KEY_VIOLATION:
+                            # This is raised when a field is set with `ondelete='restrict'`, at
+                            # unlink only.
+                            msg += _(' another model requires the record being deleted. If possible, archive it instead.')
+                            constraint = inst.diag.constraint_name
+                            if model or constraint:
+                                msg += '\n\n{} {} ({}), {} {}'.format(
+                                    _('Model:'), model._description if model else _('Unknown'), model._name if model else _('Unknown'),
+                                    _('Constraint:'), constraint if constraint else _('Unknown'),
+                                )
                     except Exception:
                         pass
                     raise ValidationError(msg)
                 else:
-                    raise ValidationError(inst[0])
+                    raise ValidationError(inst.args[0])
 
     return wrapper
 

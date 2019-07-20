@@ -7,13 +7,13 @@
             <form string="Pay Order">
                 <group>
                     <field name="session_id" invisible="True"/>
-                    <field name="journal_id" />
+                    <field name="journal_id" domain="[('journal_user', '=', True)]"/>
                     <field name="amount" />
                     <field name="payment_name"/>
                 </group>
                 <footer>
                     <button name="check" string="Make Payment" type="object" class="btn-primary"/>
-                    <button special="cancel" string="Cancel" class="btn-default"/>
+                    <button special="cancel" string="Cancel" class="btn-secondary"/>
                 </footer>
             </form>
             </field>
@@ -22,7 +22,6 @@
             <field name="name">Payment</field>
             <field name="type">ir.actions.act_window</field>
             <field name="res_model">pos.make.payment</field>
-            <field name="view_type">form</field>
             <field name="view_mode">form</field>
             <field name="target">new</field>
         </record>

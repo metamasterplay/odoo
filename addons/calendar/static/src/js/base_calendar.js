@@ -1,22 +1,25 @@
 odoo.define('base_calendar.base_calendar', function (require) {
 "use strict";
 
-var bus = require('bus.bus').bus;
-var field_registry = require('web.field_registry');
-var Notification = require('web.notification').Notification;
-var relational_fields = require('web.relational_fields');
+var BasicModel = require('web.BasicModel');
+var fieldRegistry = require('web.field_registry');
+var Notification = require('web.Notification');
+var relationalFields = require('web.relational_fields');
 var session = require('web.session');
 var WebClient = require('web.WebClient');
 
-var FieldMany2ManyTags = relational_fields.FieldMany2ManyTags;
+var FieldMany2ManyTags = relationalFields.FieldMany2ManyTags;
 
 
 var CalendarNotification = Notification.extend({
     template: "CalendarNotification",
+    xmlDependencies: (Notification.prototype.xmlDependencies || [])
+        .concat(['/calendar/static/src/xml/notification_calendar.xml']),
 
-    init: function(parent, title, text, eid) {
-        this._super(parent, title, text, true);
-        this.eid = eid;
+    init: function(parent, params) {
+        this._super(parent, params);
+        this.eid = params.eventID;
+        this.sticky = true;
 
         this.events = _.extend(this.events || {}, {
             'click .link2event': function() {
@@ -39,8 +42,8 @@ var CalendarNotification = Notification.extend({
             },
 
             'click .link2showed': function() {
-                this.destroy(true);
-                this._rpc({route: '/calendar/notify_ack'});
+                this._rpc({route: '/calendar/notify_ack'})
+                    .then(this.destroy.bind(this), this.destroy.bind(this));
             },
         });
     },
@@ -54,10 +57,8 @@ WebClient.include({
         // Clear previously set timeouts and destroy currently displayed calendar notifications
         clearTimeout(this.get_next_calendar_notif_timeout);
         _.each(this.calendar_notif_timeouts, clearTimeout);
-        _.each(this.calendar_notif, function(notif) {
-            if (!notif.isDestroyed()) {
-                notif.destroy();
-            }
+        _.each(this.calendar_notif, function (notificationID) {
+            self.call('notification', 'close', notificationID, true);
         });
         this.calendar_notif_timeouts = {};
         this.calendar_notif = {};
@@ -65,9 +66,13 @@ WebClient.include({
         // For each notification, set a timeout to display it
         _.each(notifications, function(notif) {
             self.calendar_notif_timeouts[notif.event_id] = setTimeout(function() {
-                var notification = new CalendarNotification(self.notification_manager, notif.title, notif.message, notif.event_id);
-                self.notification_manager.display(notification);
-                self.calendar_notif[notif.event_id] = notification;
+                var notificationID = self.call('notification', 'notify', {
+                    Notification: CalendarNotification,
+                    title: notif.title,
+                    message: notif.message,
+                    eventID: notif.event_id,
+                });
+                self.calendar_notif[notif.event_id] = notificationID;
             }, notif.timer * 1000);
             last_notif_timer = Math.max(last_notif_timer, notif.timer);
         });
@@ -79,8 +84,10 @@ WebClient.include({
     },
     get_next_calendar_notif: function() {
         session.rpc("/calendar/notify", {}, {shadow: true})
-            .done(this.display_calendar_notif.bind(this))
-            .fail(function(err, ev) {
+            .then(this.display_calendar_notif.bind(this))
+            .guardedCatch(function(reason) { //
+                var err = reason.message;
+                var ev = reason.event;
                 if(err.code === -32098) {
                     // Prevent the CrashManager to display an error
                     // in case of an xhr error not due to a server error
@@ -93,7 +100,7 @@ WebClient.include({
         // in which the current user is involved is created, edited or deleted
         this.calendar_notif_timeouts = {};
         this.calendar_notif = {};
-        bus.on('notification', this, function (notifications) {
+        this.call('bus_service', 'onNotification', this, function (notifications) {
             _.each(notifications, (function (notification) {
                 if (notification[0][1] === 'calendar.alarm') {
                     this.display_calendar_notif(notification[1]);
@@ -104,16 +111,53 @@ WebClient.include({
     },
 });
 
-var Many2ManyAttendee = FieldMany2ManyTags.extend({
-    supported_field_types: [],
-    tag_template: "Many2ManyAttendeeTag",
-    // FIXME: This widget used to refetch the relational data fields needed to
-    //        its rendering. Basically, all usual fields for tags plus "status".
-    //        This can't currently be done with the current implementation of
-    //        the new view. For now, the attendee tags will be missing the
-    //        status indicator in studio mode.
+BasicModel.include({
+    /**
+     * @private
+     * @param {Object} record
+     * @param {string} fieldName
+     * @returns {Promise}
+     */
+    _fetchSpecialAttendeeStatus: function (record, fieldName) {
+        var context = record.getContext({fieldName: fieldName});
+        var attendeeIDs = record.data[fieldName] ? this.localData[record.data[fieldName]].res_ids : [];
+        var meetingID = _.isNumber(record.res_id) ? record.res_id : false;
+        return this._rpc({
+            model: 'res.partner',
+            method: 'get_attendee_detail',
+            args: [attendeeIDs, meetingID],
+            context: context,
+        }).then(function (result) {
+            return _.map(result, function (d) {
+                return _.object(['id', 'display_name', 'status', 'color'], d);
+            });
+        });
+    },
 });
 
-field_registry.add('many2manyattendee', Many2ManyAttendee);
+var Many2ManyAttendee = FieldMany2ManyTags.extend({
+    // as this widget is model dependant (rpc on res.partner), use it in another
+    // context probably won't work
+    // supportedFieldTypes: ['many2many'],
+    description: "",
+    tag_template: "Many2ManyAttendeeTag",
+    specialData: "_fetchSpecialAttendeeStatus",
+
+    //--------------------------------------------------------------------------
+    // Private
+    //--------------------------------------------------------------------------
+
+    /**
+     * @override
+     * @private
+     */
+    _getRenderTagsContext: function () {
+        var result = this._super.apply(this, arguments);
+        result.attendeesData = this.record.specialData.partner_ids;
+        return result;
+    },
+});
+
+fieldRegistry.add('many2manyattendee', Many2ManyAttendee);
 
 });

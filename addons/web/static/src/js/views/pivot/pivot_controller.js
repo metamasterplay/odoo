@@ -22,7 +22,7 @@ var _t = core._t;
 var QWeb = core.qweb;
 
 var PivotController = AbstractController.extend({
-    template: 'PivotView',
+    contentTemplate: 'PivotView',
     events: {
         'click .o_pivot_header_cell_opened': '_onOpenHeaderClick',
         'click .o_pivot_header_cell_closed': '_onClosedHeaderClick',
@@ -45,13 +45,14 @@ var PivotController = AbstractController.extend({
         this.groupableFields = params.groupableFields;
         this.title = params.title;
         this.enableLinking = params.enableLinking;
+        // views to use in the action triggered when a data cell is clicked
+        this.views = params.views;
         this.lastHeaderSelected = null;
     },
     /**
      * @override
      */
     start: function () {
-        this.$el.toggleClass('o_enableLinking', this.enableLinking);
         this.$fieldSelection = this.$('.o_field_selection');
         core.bus.on('click', this, function () {
             this.$fieldSelection.empty();
@@ -74,22 +75,22 @@ var PivotController = AbstractController.extend({
     //--------------------------------------------------------------------------
 
     /**
-     * We save the current measure and group bys, so we can restore the view
-     * when we save the current state in the search view.
+     * Returns the current measures and groupbys, so we can restore the view
+     * when we save the current state in the search view, or when we add it to
+     * the dashboard.
      *
      * @override method from AbstractController
      * @returns {Object}
      */
-    getContext: function () {
-        if (this.handle) {
-            var state = this.model.get(this.handle);
-            return {
+    getOwnedQueryParams: function () {
+        var state = this.model.get();
+        return {
+            context: {
                 pivot_measures: state.measures,
-                pivot_column_groupby: state.data.main_col.groupbys,
-                pivot_row_groupby: state.data.main_row.groupbys,
-            };
-        }
-        return {};
+                pivot_column_groupby: state.colGroupBys,
+                pivot_row_groupby: state.rowGroupBys,
+            }
+        };
     },
     /**
      * Render the buttons according to the PivotView.buttons template and
@@ -102,7 +103,7 @@ var PivotController = AbstractController.extend({
      */
     renderButtons: function ($node) {
         if ($node) {
-            var context = {measures: _.pairs(_.omit(this.measures, '__count'))};
+            var context = {measures: _.sortBy(_.pairs(_.omit(this.measures, '__count')), function (x) { return x[1].string.toLowerCase(); })};
             this.$buttons = $(QWeb.render('PivotView.buttons', context));
             this.$buttons.click(this._onButtonClick.bind(this));
             this.$buttons.find('button').tooltip();
@@ -126,9 +127,11 @@ var PivotController = AbstractController.extend({
         var table = this.model.exportData();
         if(table.measure_row.length + 1 > 256) {
             crash_manager.show_message(_t("For Excel compatibility, data cannot be exported if there are more than 256 columns.\n\nTip: try to flip axis, filter further or reduce the number of measures."));
+            framework.unblockUI();
             return;
         }
         framework.blockUI();
+        table.title = this.title;
         session.get_file({
             url: '/web/pivot/export_xls',
             data: {data: JSON.stringify(table)},
@@ -162,28 +165,25 @@ var PivotController = AbstractController.extend({
             fields: fields
         }));
 
-        this.$fieldSelection.find('ul').first()
-            .css({top: top, left: left})
-            .show();
+        var cssProps = {top: top};
+        cssProps[_t.database.parameters.direction === 'rtl' ? 'right' : 'left'] =
+            _t.database.parameters.direction === 'rtl' ? this.$el.width() - left : left;
+        this.$fieldSelection.find('.dropdown-menu').first()
+            .css(cssProps)
+            .addClass('show');
+    },
+    /**
+     * @override
+     * @private
+     */
+    _startRenderer: function () {
+        return this.renderer.appendTo(this.$('.o_pivot'));
     },
     /**
      * @private
      */
-    _update: function (state) {
+    _update: function () {
         this._updateButtons();
-        var hasNoContent = !state.has_data || !state.measures.length;
-
-        if (hasNoContent) {
-            if (!this.$('.oe_view_nocontent').length) {
-                this.renderer.$el.detach();
-                this.$el.append(QWeb.render('PivotView.nodata'));
-            }
-        } else {
-            if (!document.contains(this.renderer.el)) {
-                this.$('div.oe_view_nocontent').remove();
-                this.$el.append(this.renderer.$el);
-            }
-        }
         return this._super.apply(this, arguments);
     },
     /**
@@ -197,9 +197,13 @@ var PivotController = AbstractController.extend({
         var state = this.model.get({raw: true});
         _.each(this.measures, function (measure, name) {
             var isSelected = _.contains(state.measures, name);
-            self.$buttons.find('li[data-field="' + name + '"]')
+            self.$buttons.find('.dropdown-item[data-field="' + name + '"]')
                          .toggleClass('selected', isSelected);
         });
+        var noDataDisplayed = !state.has_data || !state.measures.length;
+        this.$buttons.find('.o_pivot_flip_button').prop('disabled', noDataDisplayed);
+        this.$buttons.find('.o_pivot_expand_button').prop('disabled', noDataDisplayed);
+        this.$buttons.find('.o_pivot_download').prop('disabled', noDataDisplayed);
     },
 
     //--------------------------------------------------------------------------
@@ -212,24 +216,23 @@ var PivotController = AbstractController.extend({
      * current measures, or a request to flip/expand/download data.
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onButtonClick: function (event) {
-        var $target = $(event.target);
+    _onButtonClick: function (ev) {
+        var $target = $(ev.target);
         if ($target.hasClass('o_pivot_flip_button')) {
-            this.model.flip(this.handle);
-            this.update(null, {reload: false});
+            this.model.flip();
+            this.update({}, {reload: false});
         }
         if ($target.hasClass('o_pivot_expand_button')) {
             this.model
-                    .expandAll(this.handle)
-                    .then(this.update_state.bind(this));
+                    .expandAll()
+                    .then(this.update.bind(this, {}, {reload: false}));
         }
         if ($target.parents('.o_pivot_measures_list').length) {
-            var parent = $target.parent();
-            var field = parent.data('field');
-            event.preventDefault();
-            event.stopPropagation();
+            var field = $target.data('field');
+            ev.preventDefault();
+            ev.stopPropagation();
             this.model
                     .toggleMeasure(field)
                     .then(this.update.bind(this, {}, {reload: false}));
@@ -244,43 +247,39 @@ var PivotController = AbstractController.extend({
      * corresponding record.
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onCellClick: function (event) {
-        var $target = $(event.target);
+    _onCellClick: function (ev) {
+        var $target = $(ev.currentTarget);
         if ($target.hasClass('o_pivot_header_cell_closed') ||
             $target.hasClass('o_pivot_header_cell_opened') ||
             $target.hasClass('o_empty') ||
+            $target.data('type') === 'variation' ||
             !this.enableLinking) {
             return;
         }
-        var row_id = $target.data('id');
-        var col_id = $target.data('col_id');
         var state = this.model.get(this.handle);
-        var row_domain = state.data.headers[row_id].domain;
-        var col_domain = state.data.headers[col_id].domain;
-        var context = _.omit(_.clone(state.context), 'group_by');
-
-        function _find_view_info (views, view_type) {
-            return _.find(views, function (view) {
-                return view[1] === view_type;
-            }) || [false, view_type];
+        var colDomain, rowDomain;
+        if ($target.data('type') === 'comparisonData') {
+            colDomain = this.model.getHeader($target.data('col_id')).comparisonDomain || [];
+            rowDomain = this.model.getHeader($target.data('id')).comparisonDomain || [];
+        } else {
+            colDomain = this.model.getHeader($target.data('col_id')).domain || [];
+            rowDomain = this.model.getHeader($target.data('id')).domain || [];
         }
-        var views = [
-            _find_view_info(this.options.action.views, "list"),
-            _find_view_info(this.options.action.views, "form"),
-        ];
+        var context = _.omit(state.context, function (val, key) {
+            return key === 'group_by' || _.str.startsWith(key, 'search_default_');
+        });
 
         this.do_action({
             type: 'ir.actions.act_window',
             name: this.title,
-            res_model: this.model,
-            views: views,
-            view_type : "list",
-            view_mode : "list",
+            res_model: this.modelName,
+            views: this.views,
+            view_mode: 'list',
             target: 'current',
             context: context,
-            domain: state.domain.concat(row_domain, col_domain),
+            domain: state.domain.concat(rowDomain, colDomain),
         });
     },
     /**
@@ -289,10 +288,10 @@ var PivotController = AbstractController.extend({
      * clicked header, if a corresponging groupby has already been selected.
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onClosedHeaderClick: function (event) {
-        var $target = $(event.target);
+    _onClosedHeaderClick: function (ev) {
+        var $target = $(ev.target);
         var id = $target.data('id');
         var header = this.model.getHeader(id);
         var groupbys = header.root.groupbys;
@@ -305,25 +304,25 @@ var PivotController = AbstractController.extend({
             this.lastHeaderSelected = id;
             var position = $target.position();
             var top = position.top + $target.height();
-            var left = position.left + event.offsetX;
+            var left = position.left + ev.offsetX;
             this._renderFieldSelection(top, left);
-            event.stopPropagation();
+            ev.stopPropagation();
         }
     },
     /**
      * This handler is called when the user selects a field in the dropdown menu
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onFieldMenuSelection: function (event) {
-        event.preventDefault();
-        var $target = $(event.target);
-        if ($target.parent().hasClass('disabled')) {
-            event.stopPropagation();
+    _onFieldMenuSelection: function (ev) {
+        ev.preventDefault();
+        var $target = $(ev.target);
+        if ($target.hasClass('disabled')) {
+            ev.stopPropagation();
             return;
         }
-        var field = $target.parent().data('field');
+        var field = $target.data('field');
         var interval = $target.data('interval');
         var header = this.model.getHeader(this.lastHeaderSelected);
         if (interval) {
@@ -337,32 +336,31 @@ var PivotController = AbstractController.extend({
      * If the user clicks on a measure row, we can perform an in-memory sort
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onMeasureRowClick: function (event) {
-        var $target = $(event.target);
+    _onMeasureRowClick: function (ev) {
+        var $target = $(ev.target);
         var col_id = $target.data('id');
         var measure = $target.data('measure');
         var isAscending = $target.hasClass('o_pivot_measure_row_sorted_asc');
-        this.model
-            .sortRows(this.handle, col_id, measure, isAscending)
-            .then(this.update.bind(this, {}, {reload: false}));
+        var dataType = $target.data('data_type');
+        this.model.sortRows(col_id, measure, isAscending, dataType);
+        this.update({}, {reload: false});
     },
     /**
      * This method is called when someone clicks on an open header.  When that
      * happens, we want to close the header, then redisplay the view.
      *
      * @private
-     * @param {MouseEvent} event
+     * @param {MouseEvent} ev
      */
-    _onOpenHeaderClick: function (event) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        var headerID = $(event.target).data('id');
-        this.model.closeHeader(headerID)
+    _onOpenHeaderClick: function (ev) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        var headerID = $(ev.target).data('id');
+        this.model.closeHeader(headerID);
         this.update({}, {reload: false});
     },
-
 });
 
 return PivotController;

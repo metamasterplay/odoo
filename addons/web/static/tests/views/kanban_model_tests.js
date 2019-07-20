@@ -55,14 +55,16 @@ QUnit.module('Views', {
             limit: 40,
             modelName: 'partner',
             openGroupByDefault: true,
+            viewType: 'kanban',
         };
-    }
+    },
 }, function () {
 
     QUnit.module('KanbanModel');
 
-    QUnit.test('load grouped + add a new group', function (assert) {
-        assert.expect(20);
+    QUnit.test('load grouped + add a new group', async function (assert) {
+        var done = assert.async();
+        assert.expect(22);
 
         var calledRoutes = {};
         var model = createModel({
@@ -83,11 +85,12 @@ QUnit.module('Views', {
             fieldNames: ['foo'],
         });
 
-        model.load(params).then(function (resultID) {
+        model.load(params).then(async function (resultID) {
             // various checks on the load result
             var state = model.get(resultID);
             assert.ok(_.isEqual(state.groupedBy, ['product_id']), 'should be grouped by "product_id"');
-            assert.strictEqual(state.count, 2, 'should have found 2 groups');
+            assert.strictEqual(state.data.length, 2, 'should have found 2 groups');
+            assert.strictEqual(state.count, 2, 'both groups contain one record');
             var xphoneGroup = _.findWhere(state.data, {res_id: 37});
             assert.strictEqual(xphoneGroup.model, 'partner', 'group should have correct model');
             assert.ok(xphoneGroup, 'should have a group for res_id 37');
@@ -100,9 +103,10 @@ QUnit.module('Views', {
             assert.strictEqual(xphoneGroup.limit, 40, 'limit in a group should be 40');
 
             // add a new group
-            model.createGroup('xpod', resultID);
+            await model.createGroup('xpod', resultID);
             state = model.get(resultID);
-            assert.strictEqual(state.count, 3, 'should now have 3 groups');
+            assert.strictEqual(state.data.length, 3, 'should now have 3 groups');
+            assert.strictEqual(state.count, 2, 'there are still 2 records');
             var xpodGroup = _.findWhere(state.data, {value: 'xpod'});
             assert.strictEqual(xpodGroup.model, 'partner', 'new group should have correct model');
             assert.ok(xpodGroup, 'should have an "xpod" group');
@@ -113,22 +117,31 @@ QUnit.module('Views', {
 
             // check the rpcs done
             assert.strictEqual(Object.keys(calledRoutes).length, 3, 'three different routes have been called');
-            var nbReadGroups = calledRoutes['/web/dataset/call_kw/partner/read_group'];
+            var nbReadGroups = calledRoutes['/web/dataset/call_kw/partner/web_read_group'];
             var nbSearchRead = calledRoutes['/web/dataset/search_read'];
             var nbNameCreate = calledRoutes['/web/dataset/call_kw/product/name_create'];
             assert.strictEqual(nbReadGroups, 1, 'should have done 1 read_group');
             assert.strictEqual(nbSearchRead, 2, 'should have done 2 search_read');
             assert.strictEqual(nbNameCreate, 1, 'should have done 1 name_create');
             model.destroy();
+            done();
         });
     });
 
-    QUnit.test('archive/restore a column', function (assert) {
+    QUnit.test('archive/restore a column', async function (assert) {
+        var done = assert.async();
         assert.expect(4);
 
         var model = createModel({
             Model: KanbanModel,
             data: this.data,
+            mockRPC: function (route, args) {
+                if (route === '/web/dataset/call_kw/partner/action_archive') {
+                    this.data.partner.records[0].active = false;
+                    return Promise.resolve();
+                }
+                return this._super.apply(this, arguments);
+            },
         });
 
         var params = _.extend(this.params, {
@@ -136,7 +149,7 @@ QUnit.module('Views', {
             fieldNames: ['foo'],
         });
 
-        model.load(params).then(function (resultID) {
+        model.load(params).then(async function (resultID) {
             var state = model.get(resultID);
             var xphoneGroup = _.findWhere(state.data, {res_id: 37});
             var xpadGroup = _.findWhere(state.data, {res_id: 41});
@@ -145,24 +158,26 @@ QUnit.module('Views', {
 
             // archive the column 'xphone'
             var recordIDs = _.pluck(xphoneGroup.data, 'id');
-            model.toggleActive(recordIDs, false, xphoneGroup.id);
+            await model.actionArchive(recordIDs, xphoneGroup.id);
             state = model.get(resultID);
             xphoneGroup = _.findWhere(state.data, {res_id: 37});
             assert.strictEqual(xphoneGroup.count, 0, 'xphone group has no record anymore');
             xpadGroup = _.findWhere(state.data, {res_id: 41});
             assert.strictEqual(xpadGroup.count, 1, 'xpad group still has one record');
             model.destroy();
+            done();
         });
     });
 
-    QUnit.test('kanban model does not allow nested groups', function (assert) {
+    QUnit.test('kanban model does not allow nested groups', async function (assert) {
+        var done = assert.async();
         assert.expect(2);
 
         var model = createModel({
             Model: KanbanModel,
             data: this.data,
             mockRPC: function (route, args) {
-                if (args.method === 'read_group') {
+                if (args.method === 'web_read_group') {
                     assert.deepEqual(args.kwargs.groupby, ['product_id'],
                         "the second level of groupBy should have been removed");
                 }
@@ -182,13 +197,16 @@ QUnit.module('Views', {
                 "the second level of groupBy should have been removed");
 
             model.destroy();
+            done();
         });
     });
 
-    QUnit.test('resequence columns and records', function (assert) {
+    QUnit.test('resequence columns and records', async function (assert) {
         var done = assert.async();
         assert.expect(8);
 
+        this.data.product.fields.sequence = {string: "Sequence", type: "integer"};
+        this.data.partner.fields.sequence = {string: "Sequence", type: "integer"};
         this.data.partner.records.push({id: 3, foo: 'aaa', product_id: 37});
 
         var nbReseq = 0;
@@ -201,7 +219,7 @@ QUnit.module('Views', {
                     if (nbReseq === 1) { // resequencing columns
                         assert.deepEqual(args.ids, [41, 37],
                             "ids should be correct");
-                        assert.strictEqual(args.model, 'product_id',
+                        assert.strictEqual(args.model, 'product',
                             "model should be correct");
                     } else if (nbReseq === 2) { // resequencing records
                         assert.deepEqual(args.ids, [3, 1],
@@ -209,7 +227,6 @@ QUnit.module('Views', {
                         assert.strictEqual(args.model, 'partner',
                             "model should be correct");
                     }
-                    return $.when();
                 }
                 return this._super.apply(this, arguments);
             },
@@ -226,7 +243,7 @@ QUnit.module('Views', {
                     "first group should be res_id 37");
 
                 // resequence columns
-                return model.resequence('product_id', [41, 37], stateID);
+                return model.resequence('product', [41, 37], stateID);
             })
             .then(function (stateID) {
                 var state = model.get(stateID);
@@ -246,7 +263,117 @@ QUnit.module('Views', {
                 model.destroy();
                 done();
             });
+    });
 
+    QUnit.test('add record to group', async function (assert) {
+        var done = assert.async();
+        assert.expect(8);
+
+        var self = this;
+        var model = createModel({
+            Model: KanbanModel,
+            data: this.data,
+        });
+        var params = _.extend(this.params, {
+            groupedBy: ['product_id'],
+            fieldNames: ['foo'],
+        });
+
+        model.load(params).then(function (stateID) {
+            self.data.partner.records.push({id: 3, foo: 'new record', product_id: 37});
+
+            var state = model.get(stateID);
+            assert.deepEqual(state.res_ids, [1, 2],
+                "state should have the correct res_ids");
+            assert.strictEqual(state.count, 2,
+                "state should have the correct count");
+            assert.strictEqual(state.data[0].count, 1,
+                "first group should contain one record");
+
+            return model.addRecordToGroup(state.data[0].id, 3).then(function () {
+                var state = model.get(stateID);
+                assert.deepEqual(state.res_ids, [3, 1, 2],
+                    "state should have the correct res_ids");
+                assert.strictEqual(state.count, 3,
+                    "state should have the correct count");
+                assert.deepEqual(state.data[0].res_ids, [3, 1],
+                    "new record's id should have been added to the res_ids");
+                assert.strictEqual(state.data[0].count, 2,
+                    "first group should now contain two records");
+                assert.strictEqual(state.data[0].data[0].data.foo, 'new record',
+                    "new record should have been fetched");
+            });
+        }).then(function() {
+            model.destroy();
+            done();
+        })
+
+    });
+
+    QUnit.test('call get (raw: true) before loading x2many data', async function (assert) {
+        // Sometimes, get can be called on a datapoint that is currently being
+        // reloaded, and thus in a partially updated state (e.g. in a kanban
+        // view, the user interacts with the searchview, and before the view is
+        // fully reloaded, it clicks on CREATE). Ideally, this shouldn't happen,
+        // but with the sync API of get, we can't change that easily. So at most,
+        // we can ensure that it doesn't crash. Moreover, sensitive functions
+        // requesting the state for more precise information that, e.g., the
+        // count, can do that in the mutex to ensure that the state isn't
+        // currently being reloaded.
+        // In this test, we have a grouped kanban view with a one2many, whose
+        // relational data is loaded in batch, once for all groups. We call get
+        // when the search_read for the first group has returned, but not the
+        // second (and thus, the read of the one2many hasn't started yet).
+        // Note: this test can be removed as soon as search_reads are performed
+        // alongside read_group.
+        var done = assert.async();
+        assert.expect(2);
+
+        this.data.partner.records[1].product_ids = [37, 41];
+        this.params.fieldsInfo = {
+            kanban: {
+                product_ids: {
+                    fieldsInfo: {
+                        default: { display_name: {}, color: {} },
+                    },
+                    relatedFields: this.data.product.fields,
+                    viewType: 'default',
+                },
+            },
+        };
+        this.params.viewType = 'kanban';
+        this.params.groupedBy = ['foo'];
+
+        var block;
+        var def = testUtils.makeTestPromise();
+        var model = await createModel({
+            Model: KanbanModel,
+            data: this.data,
+            mockRPC: function (route) {
+                var result = this._super.apply(this, arguments);
+                if (route === '/web/dataset/search_read' && block) {
+                    block = false;
+                    return Promise.all([def]).then(_.constant(result));
+                }
+                return result;
+            },
+        });
+
+        model.load(this.params).then(function (handle) {
+            block = true;
+            model.reload(handle, {});
+
+            var state = model.get(handle, {raw: true});
+            assert.strictEqual(state.count, 2);
+
+            def.resolve();
+
+            state = model.get(handle, {raw: true});
+            assert.strictEqual(state.count, 2);
+        }).then(function() {
+            model.destroy();
+            done();
+        });
     });
 });
 

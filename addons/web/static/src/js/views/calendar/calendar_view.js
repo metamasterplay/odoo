@@ -21,15 +21,23 @@ var fieldsToGather = [
 var CalendarView = AbstractView.extend({
     display_name: _lt('Calendar'),
     icon: 'fa-calendar',
-    config: {
+    jsLibs: ['/web/static/lib/fullcalendar/js/fullcalendar.js'],
+    cssLibs: ['/web/static/lib/fullcalendar/css/fullcalendar.css'],
+    config: _.extend({}, AbstractView.prototype.config, {
         Model: CalendarModel,
         Controller: CalendarController,
         Renderer: CalendarRenderer,
-    },
+    }),
+    viewType: 'calendar',
+    searchMenuTypes: ['filter', 'favorite'],
+
+    /**
+     * @override
+     */
     init: function (viewInfo, params) {
         this._super.apply(this, arguments);
-        var arch = viewInfo.arch;
-        var fields = viewInfo.fields;
+        var arch = this.arch;
+        var fields = this.fields;
         var attrs = arch.attrs;
 
         if (!attrs.date_start) {
@@ -107,31 +115,44 @@ var CalendarView = AbstractView.extend({
 
         //if quick_add = False, we don't allow quick_add
         //if quick_add = not specified in view, we use the default widgets.QuickCreate
-        //if quick_add = is NOT False and IS specified in view, we this one for widgets.QuickCreate'   
-        this.controllerParams.quick_add_pop = (!('quick_add' in attrs) || utils.toBoolElse(attrs.quick_add+'', true));
-        this.controllerParams.disable_quick_create =  params.disable_quick_create || !this.controllerParams.quick_add_pop;
-        this.controllerParams.confirm_on_delete = true;
-        // If this field is set ot true, we don't open the event in form view, but in a popup with the view_id passed by this parameter
-        this.controllerParams.formViewId = !attrs.form_view_id || !utils.toBoolElse(attrs.form_view_id, true) ? false : attrs.form_view_id;
+        //if quick_add = is NOT False and IS specified in view, we this one for widgets.QuickCreate'
+        this.controllerParams.quickAddPop = (!('quick_add' in attrs) || utils.toBoolElse(attrs.quick_add+'', true));
+        this.controllerParams.disableQuickCreate =  params.disable_quick_create || !this.controllerParams.quickAddPop;
+
+        // If form_view_id is set, then the calendar view will open a form view
+        // with this id, when it needs to edit or create an event.
+        this.controllerParams.formViewId =
+            attrs.form_view_id ? parseInt(attrs.form_view_id, 10) : false;
+        if (!this.controllerParams.formViewId && params.action) {
+            var formViewDescr = _.find(params.action.views, function (v) {
+                return v.type ===  'form';
+            });
+            if (formViewDescr) {
+                this.controllerParams.formViewId = formViewDescr.viewID;
+            }
+        }
+
         this.controllerParams.readonlyFormViewId = !attrs.readonly_form_view_id || !utils.toBoolElse(attrs.readonly_form_view_id, true) ? false : attrs.readonly_form_view_id;
+        this.controllerParams.eventOpenPopup = utils.toBoolElse(attrs.event_open_popup || '', false);
         this.controllerParams.mapping = mapping;
         this.controllerParams.context = params.context || {};
+        this.controllerParams.displayName = params.action && params.action.name;
 
         this.rendererParams.displayFields = displayFields;
-        this.rendererParams.eventTemplate = _.findWhere(arch.children, {'tag': 'template'});
+        this.rendererParams.eventTemplate = _.findWhere(arch.children, {'tag': 'templates'});
+        this.rendererParams.model = viewInfo.model;
 
         this.loadParams.fieldNames = _.uniq(fieldNames);
         this.loadParams.mapping = mapping;
         this.loadParams.fields = fields;
         this.loadParams.fieldsInfo = viewInfo.fieldsInfo;
-        this.loadParams.editable = !this.controllerParams.read_only_mode && !fields[mapping.date_start].readonly;
-        this.loadParams.creatable = !this.controllerParams.read_only_mode;
+        this.loadParams.editable = !fields[mapping.date_start].readonly;
+        this.loadParams.creatable = true;
         this.loadParams.eventLimit = eventLimit;
-        this.loadParams.field_color = attrs.color;
+        this.loadParams.fieldColor = attrs.color;
 
         this.loadParams.filters = filters;
-        this.loadParams.mode = attrs.mode;
-        this.loadParams.scale_zoom = attrs.scale_zoom;
+        this.loadParams.mode = (params.context && params.context.default_mode) || attrs.mode;
         this.loadParams.initialDate = moment(params.initialDate || new Date());
     },
 });

@@ -2,11 +2,16 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from odoo.addons.sale.tests.test_sale_common import TestSale
+from odoo.tests import tagged
 
 
+@tagged('post_install', '-at_install')
 class TestSaleExpense(TestSale):
     def test_sale_expense(self):
         """ Test the behaviour of sales orders when managing expenses """
+        # force the pricelist to have the same currency as the company
+        self.env.ref('product.list0').currency_id = self.env.ref('base.main_company').currency_id
+
         # create a so with a product invoiced on delivery
         prod = self.env.ref('product.product_product_1')
         so = self.env['sale.order'].create({
@@ -37,7 +42,7 @@ class TestSaleExpense(TestSale):
         exp = self.env['hr.expense'].create({
             'name': 'Air Travel',
             'product_id': prod_exp_1.id,
-            'analytic_account_id': so.project_id.id,
+            'analytic_account_id': so.analytic_account_id.id,
             'unit_amount': 621.54,
             'employee_id': employee.id,
             'sheet_id': sheet.id
@@ -47,7 +52,7 @@ class TestSaleExpense(TestSale):
         # Create Expense Entries
         sheet.action_sheet_move_create()
         # expense should now be in sales order
-        self.assertTrue(prod_exp_1 in map(lambda so: so.product_id, so.order_line), 'Sale Expense: expense product should be in so')
+        self.assertIn(prod_exp_1, so.mapped('order_line.product_id'), 'Sale Expense: expense product should be in so')
         sol = so.order_line.filtered(lambda sol: sol.product_id.id == prod_exp_1.id)
         self.assertEqual((sol.price_unit, sol.qty_delivered), (621.54, 1.0), 'Sale Expense: error when invoicing an expense at cost')
         self.assertEqual(so.amount_total, init_price, 'Sale Expense: price of so not updated after adding expense')
@@ -64,8 +69,8 @@ class TestSaleExpense(TestSale):
         exp = self.env['hr.expense'].create({
             'name': 'Car Travel',
             'product_id': prod_exp_2.id,
-            'analytic_account_id': so.project_id.id,
-            'product_uom_id': self.env.ref('product.product_uom_km').id,
+            'analytic_account_id': so.analytic_account_id.id,
+            'product_uom_id': self.env.ref('uom.product_uom_km').id,
             'unit_amount': 0.15,
             'quantity': 100,
             'employee_id': employee.id,
@@ -76,13 +81,12 @@ class TestSaleExpense(TestSale):
         # Create Expense Entries
         sheet.action_sheet_move_create()
         # expense should now be in sales order
-        self.assertTrue(prod_exp_2 in map(lambda so: so.product_id, so.order_line), 'Sale Expense: expense product should be in so')
+        self.assertIn(prod_exp_2, so.mapped('order_line.product_id'), 'Sale Expense: expense product should be in so')
         sol = so.order_line.filtered(lambda sol: sol.product_id.id == prod_exp_2.id)
         self.assertEqual((sol.price_unit, sol.qty_delivered), (prod_exp_2.list_price, 100.0), 'Sale Expense: error when invoicing an expense at cost')
         self.assertEqual(so.amount_total, init_price, 'Sale Expense: price of so not updated after adding expense')
         # self.assertTrue(so.invoice_status, 'no', 'Sale Expense: expenses should not impact the invoice_status of the so')
 
         # both expenses should be invoiced
-        inv_id = so.action_invoice_create()
-        inv = self.env['account.invoice'].browse(inv_id)
+        inv = so._create_invoices()
         self.assertEqual(inv.amount_untaxed, 621.54 + (prod_exp_2.list_price * 100.0), 'Sale Expense: invoicing of expense is wrong')

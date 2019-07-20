@@ -4,32 +4,62 @@ odoo.define('web.FormRenderer', function (require) {
 var BasicRenderer = require('web.BasicRenderer');
 var config = require('web.config');
 var core = require('web.core');
-var Domain = require('web.Domain');
+var dom = require('web.dom');
+var viewUtils = require('web.viewUtils');
 
 var _t = core._t;
 var qweb = core.qweb;
 
-var FIELD_CLASSES = {
-    'one2many': 'o_field_one2many',
-};
-
-return BasicRenderer.extend({
+var FormRenderer = BasicRenderer.extend({
     className: "o_form_view",
-    custom_events: {
-        move_next: '_onMoveNext',
-        move_previous: '_onMovePrevious',
-    },
+    events: _.extend({}, BasicRenderer.prototype.events, {
+        'click .o_notification_box .oe_field_translate': '_onTranslate',
+        'click .o_notification_box .close': '_onTranslateNotificationClose',
+        'click .oe_title, .o_inner_group': '_onClick',
+        'shown.bs.tab a[data-toggle="tab"]': '_onNotebookTabChanged',
+    }),
+    custom_events: _.extend({}, BasicRenderer.prototype.custom_events, {
+        'navigation_move':'_onNavigationMove',
+        'activate_next_widget' : '_onActivateNextWidget',
+    }),
+    // default col attributes for the rendering of groups
+    INNER_GROUP_COL: 2,
+    OUTER_GROUP_COL: 2,
+
     /**
-     * @override method from BasicRenderer
-     * @param {Object} params
-     * @param {string} params.mode either 'readonly' on 'edit'
+     * @override
      */
-    init: function (parent, state, params) {
+    init: function () {
         this._super.apply(this, arguments);
         this.idsForLabels = {};
-        this.widgets = [];
-        this.mode = params.mode;
-        this.field_values = this.state.getEvalContext();
+        this.lastActivatedFieldIndex = -1;
+        this.alertFields = {};
+    },
+    /**
+     * @override
+     */
+    start: function () {
+        if (config.device.size_class <= config.device.SIZES.XS) {
+            this.$el.addClass('o_xxs_form_view');
+        }
+        return this._super.apply(this, arguments);
+    },
+    /**
+     * Called each time the form view is attached into the DOM
+     */
+    on_attach_callback: function () {
+        this._isInDom = true;
+        _.forEach(this.allFieldWidgets, function (widgets){
+            _.invoke(widgets, 'on_attach_callback');
+        });
+        this._super.apply(this, arguments);
+    },
+    /**
+     * Called each time the renderer is detached from the DOM.
+     */
+    on_detach_callback: function () {
+        this._isInDom = false;
+        this._super.apply(this, arguments);
     },
 
     //--------------------------------------------------------------------------
@@ -37,52 +67,136 @@ return BasicRenderer.extend({
     //--------------------------------------------------------------------------
 
     /**
-     * This method has two responsabilities: find every invalid fields in the
-     * current form, and making sure that they are displayed as invalid, by
-     * toggling the o_form_invalid css class.  It has to be done both on the
-     * widget, and on the label, if there is a label.
+     * Focuses the field having attribute 'default_focus' set, if any, or the
+     * first focusable field otherwise.
+     * In read mode, delegate which button to give the focus to, to the form_renderer
      *
-     * @returns {Deferred}
-     *   if it fails, it gives the list of invalid field names
+     * @returns {int | undefined} the index of the widget activated else
+     * undefined
+     */
+    autofocus: function () {
+        if (this.mode === 'readonly') {
+            var firstPrimaryFormButton =  this.$el.find('button.btn-primary:enabled:visible:first()');
+            if (firstPrimaryFormButton.length > 0) {
+                return firstPrimaryFormButton.focus();
+            } else {
+                return;
+            }
+        }
+        var focusWidget = this.defaultFocusField;
+        if (!focusWidget || !focusWidget.isFocusable()) {
+            var widgets = this.allFieldWidgets[this.state.id];
+            for (var i = 0; i < (widgets ? widgets.length : 0); i++) {
+                var widget = widgets[i];
+                if (widget.isFocusable()) {
+                    focusWidget = widget;
+                    break;
+                }
+            }
+        }
+        if (focusWidget) {
+            return focusWidget.activate({noselect: true, noAutomaticCreate: true});
+        }
+    },
+    /**
+     * Extend the method so that labels also receive the 'o_field_invalid' class
+     * if necessary.
+     *
+     * @override
+     * @see BasicRenderer.canBeSaved
+     * @param {string} recordID
+     * @returns {string[]}
      */
     canBeSaved: function () {
         var self = this;
-        var invalidFields = [];
-        var defs = [];
+        var fieldNames = this._super.apply(this, arguments);
 
-        function markWidget(widget, isValid) {
-            if (!isValid) {
-                invalidFields.push(widget.name);
-            }
-            widget.$el.toggleClass('o_form_invalid', !isValid);
-            var idForLabel = self.idsForLabels[widget.name];
-            var $label = idForLabel ? self.$('label[for=' + idForLabel + ']') : $();
-            $label.toggleClass('o_form_invalid', !isValid);
-        }
+        var $labels = this.$('label');
+        $labels.removeClass('o_field_invalid');
 
-        _.each(this.widgets, function (widget) {
-            var isValid = widget.isValid();
-            if (isValid instanceof $.Deferred) {
-                defs.push(isValid.then(function (isValid) {
-                    markWidget(widget, isValid);
-                }));
-            } else {
-                markWidget(widget, isValid);
+        _.each(fieldNames, function (fieldName) {
+            var idForLabel = self.idsForLabels[fieldName];
+            if (idForLabel) {
+                $labels
+                    .filter('[for=' + idForLabel + ']')
+                    .addClass('o_field_invalid');
             }
         });
-        return $.when.apply($, defs).then(function () {
-            if (invalidFields.length) {
-                return $.Deferred().reject(invalidFields);
+        return fieldNames;
+    },
+    /*
+     * Updates translation alert fields for the current state and display updated fields
+     *
+     *  @param {Object} alertFields
+     */
+    updateAlertFields: function (alertFields) {
+        this.alertFields[this.state.res_id] = _.extend(this.alertFields[this.state.res_id] || {}, alertFields);
+        this.displayTranslationAlert();
+    },
+    /**
+     * Show a warning message if the user modified a translated field.  For each
+     * field, the notification provides a link to edit the field's translations.
+     */
+    displayTranslationAlert: function () {
+        this.$('.o_notification_box').remove();
+        if (this.alertFields[this.state.res_id]) {
+            var $notification = $(qweb.render('notification-box', {type: 'info'}))
+                .append(qweb.render('translation-alert', {
+                    fields: this.alertFields[this.state.res_id],
+                    lang: _t.database.parameters.name
+                }));
+            if (this.$('.o_form_statusbar').length) {
+                this.$('.o_form_statusbar').after($notification);
+            } else {
+                this.$el.prepend($notification);
             }
+        }
+    },
+    /**
+     * @see BasicRenderer.confirmChange
+     *
+     * We need to reapply the idForLabel postprocessing since some widgets may
+     * have recomputed their dom entirely.
+     *
+     * @override
+     */
+    confirmChange: function () {
+        var self = this;
+        return this._super.apply(this, arguments).then(function (resetWidgets) {
+            _.each(resetWidgets, function (widget) {
+                self._setIDForLabel(widget, self.idsForLabels[widget.name]);
+            });
+            if (self.$('.o_field_invalid').length) {
+                self.canBeSaved(self.state.id);
+            }
+            return resetWidgets;
         });
     },
     /**
-     * Calls 'commitChanges' on all field widgets, so that they can notify the
-     * environment with their current value (useful for widgets that can't
-     * detect when their value changes, e.g. field 'html').
+     * Disable statusbar buttons and stat buttons so that they can't be clicked anymore
+     *
      */
-    commitChanges: function () {
-        _.invoke(this.widgets, 'commitChanges');
+    disableButtons: function () {
+        this.$('.o_statusbar_buttons button, .oe_button_box button')
+            .attr('disabled', true);
+    },
+    /**
+     * Enable statusbar buttons and stat buttons so they can be clicked again
+     *
+     */
+    enableButtons: function () {
+        this.$('.o_statusbar_buttons button, .oe_button_box button')
+            .removeAttr('disabled');
+    },
+    /**
+     * Put the focus on the last activated widget.
+     * This function is used when closing a dialog to give the focus back to the
+     * form that has opened it and ensures that the focus is in the correct
+     * field.
+     */
+    focusLastActivatedWidget: function () {
+        this._activateNextFieldWidget(this.state, this.lastActivatedFieldIndex - 1,
+            { noAutomaticCreate: true });
     },
     /**
      * returns the active tab pages for each notebook
@@ -98,7 +212,7 @@ return BasicRenderer.extend({
             var $notebook = $(this);
             var name = $notebook.data('name');
             var index = -1;
-            $notebook.find('li').each(function (i) {
+            $notebook.find('.nav-link').each(function (i) {
                 if ($(this).hasClass('active')) {
                     index = i;
                 }
@@ -106,6 +220,19 @@ return BasicRenderer.extend({
             state[name] = index;
         });
         return state;
+    },
+    /**
+     * Reset the tracking of the last activated field. The fast entry with
+     * keyboard navigation needs to track the last activated field in order to
+     * set the focus.
+     *
+     * In particular, when there are changes of mode (e.g. edit -> readonly ->
+     * edit), we do not want to auto-set the focus on the previously last
+     * activated field. To avoid this issue, this method should be called
+     * whenever there is a change of mode.
+     */
+    resetLastActivatedField: function () {
+        this.lastActivatedFieldIndex = -1;
     },
     /**
      * restore active tab pages for each notebook
@@ -119,9 +246,10 @@ return BasicRenderer.extend({
             var $notebook = $(this);
             var name = $notebook.data('name');
             if (name in state) {
-                $notebook.find('> ul > li > a[data-toggle="tab"]')
-                         .eq(state[name])
-                         .click();
+                var $page = $notebook.find('> ul > li').eq(state[name]);
+                if (!$page.hasClass('o_invisible_modifier')) {
+                    $page.find('a[data-toggle="tab"]').click();
+                }
             }
         });
     },
@@ -132,65 +260,63 @@ return BasicRenderer.extend({
      * @param {string} [params.mode] new mode, either 'edit' or 'readonly'
      * @param {string[]} [params.fieldNames] if given, the renderer will only
      *   update the fields in this list
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     updateState: function (state, params) {
         this.mode = (params && 'mode' in params) ? params.mode : this.mode;
 
         // if fieldNames are given, we update the corresponding field widget.
         // I think this is wrong, and the caller could directly call the
-        // updateWidgets method
+        // confirmChange method
         if (params.fieldNames) {
             // only update the given fields
-            return this.updateWidgets(params.fieldNames, state);
+            return this.confirmChange(state, state.id, params.fieldNames);
         }
-        this.field_values = state.getEvalContext();
         return this._super.apply(this, arguments);
-    },
-    /**
-     * Update some field widgets with a new state.  We could rerender the form
-     * view from scratch, but then it would not be as efficient, and we might
-     * lose some local state, such as the input focus cursor, or the scrolling
-     * position.
-     *
-     * @param {string[]} fields list of fields to be updated
-     * @param {Object} state new state
-     * @param {OdooEvent} [event] the event that triggered the change
-     * @returns {Deferred}
-     */
-    updateWidgets: function (fields, state, event) {
-        this.state = state;
-        this.field_values = this.state.getEvalContext();
-        var defs = [];
-        _.each(this.widgets, function (widget) {
-            if (_.contains(fields, widget.name) || widget.resetOnAnyFieldChange) {
-                defs.push(widget.reset(state, event));
-            }
-        });
-        // re-evalute the modifiers with the new state
-        this._evaluateModifiers();
-        return $.when.apply($, defs);
     },
 
     //--------------------------------------------------------------------------
     // Private
     //--------------------------------------------------------------------------
-
     /**
-     * Adds the adequate classnames to a field widget's $el.
+     * @override
+     */
+    _activateNextFieldWidget: function (record, currentIndex) {
+        //if we are the last widget, we should give the focus to the first Primary Button in the form
+        //else do the default behavior
+        if ( (currentIndex + 1) >= (this.allFieldWidgets[record.id] || []).length) {
+            this.trigger_up('focus_control_button');
+            this.lastActivatedFieldIndex = -1;
+        } else {
+            var activatedIndex =  this._super.apply(this, arguments);
+            if (activatedIndex === -1 ) { // no widget have been activated, we should go to the edit/save buttons
+                this.trigger_up('focus_control_button');
+                this.lastActivatedFieldIndex = -1;
+            }
+            else {
+                this.lastActivatedFieldIndex = activatedIndex;
+            }
+        }
+        return this.lastActivatedFieldIndex;
+    },
+    /**
+     * Add a tooltip on a button
      *
      * @private
-     * @param {Object} widget a field widget
-     * @param {Object} field description of the field
+     * @param {Object} node
+     * @param {jQuery} $button
      */
-    _addFieldClassNames: function (widget, field) {
-        widget.$el.addClass('o_form_field');
-        // classname 'o_form_field_empty' hides the widget, so we apply it in
-        // on existing records for fields with no value, in readonly mode or if the
-        // field is readonly
-        if (this.state.data.id && !widget.isSet() && (this.mode === 'readonly' || field.readonly)) {
-            widget.$el.addClass('o_form_field_empty');
-        }
+    _addButtonTooltip: function (node, $button) {
+        var self = this;
+        $button.tooltip({
+            title: function () {
+                return qweb.render('WidgetButton.tooltip', {
+                    debug: config.isDebug(),
+                    state: self.state,
+                    node: node,
+                });
+            },
+        });
     },
     /**
      * @private
@@ -198,31 +324,18 @@ return BasicRenderer.extend({
      * @param {Object} node
      */
     _addOnClickAction: function ($el, node) {
-        var self = this;
-        $el.click(function () {
-            self.trigger_up('button_clicked', {
-                attrs: node.attrs,
-                record: self.state,
-                show_wow: self.$el.hasClass('o_wow'),  // TODO: implement this (in view)
+        if (node.attrs.special || node.attrs.confirm || node.attrs.type || $el.hasClass('oe_stat_button')) {
+            var self = this;
+            $el.click(function () {
+                self.trigger_up('button_clicked', {
+                    attrs: node.attrs,
+                    record: self.state,
+                });
             });
-        });
+        }
     },
     /**
-     * @private
-     */
-    _evaluateModifiers: function () {
-        var self = this;
-        _.each(this.nodeModifiers, function (d) {
-            if ('invisible' in d.modifiers) {
-                var is_invisible = new Domain(d.modifiers.invisible).compute(self.field_values);
-                d.$el.toggleClass('o_form_invisible', is_invisible);
-                if (d.onEvalCallback) {
-                    d.onEvalCallback({invisible: is_invisible});
-                }
-            }
-        });
-    },
-    /**
+            excludedElements: ".o_notebook .nav.nav-tabs",
      * @private
      * @param {string} name
      * @returns {string}
@@ -236,24 +349,21 @@ return BasicRenderer.extend({
         return idForLabel;
     },
     /**
+     * @override
      * @private
-     * @param {jQueryElement} $el
-     * @param {Object} node
-     * @param {function} onEvalCallback
      */
-    _handleAttributes: function ($el, node, onEvalCallback) {
-        // register the modifiers with their corresponding $el so that they can
-        // be re-evaluated at each field changed
-        this.nodeModifiers.push({
-            $el: $el,
-            modifiers: JSON.parse(node.attrs.modifiers || "{}"),
-            onEvalCallback: onEvalCallback,
-        });
-        if (node.attrs.class) {
-            $el.addClass(node.attrs.class);
-        }
-        if (node.attrs.style) {
-            $el.attr('style', node.attrs.style);
+    _getRecord: function (recordId) {
+        return this.state.id === recordId ? this.state : null;
+    },
+    /**
+     * @override
+     * @private
+     */
+    _postProcessField: function (widget, node) {
+        this._super.apply(this, arguments);
+        this._setIDForLabel(widget, this._getIDForLabel(node.attrs.name));
+        if (JSON.parse(node.attrs.default_focus || "0")) {
+            this.defaultFocusField = widget;
         }
     },
     /**
@@ -263,11 +373,14 @@ return BasicRenderer.extend({
      */
     _renderButtonBox: function (node) {
         var self = this;
-        var $result = $('<' + node.tag + '>', { 'class': 'o_not_full' });
-        // Avoid to show buttons if we are in create mode (edit mode without res_id)
-        if (this.mode === 'edit' && !this.state.res_id) {
-            return $result;
-        }
+        var $result = $('<' + node.tag + '>', {class: 'o_not_full'});
+
+        // The rendering of buttons may be async (see renderFieldWidget), so we
+        // must wait for the buttons to be ready (and their modifiers to be
+        // applied) before manipulating them, as we check if they are visible or
+        // not. To do so, we extract from this.defs the promises corresponding
+        // to the buttonbox buttons, and wait for them to be resolved.
+        var nextDefIndex = this.defs.length;
         var buttons = _.map(node.children, function (child) {
             if (child.tag === 'button') {
                 return self._renderStatButton(child);
@@ -275,81 +388,73 @@ return BasicRenderer.extend({
                 return self._renderNode(child);
             }
         });
-        var buttons_partition = _.partition(buttons, function ($button) {
-            return $button.is('.o_form_invisible');
+
+        // At this point, each button is an empty div that will be replaced by
+        // the real $el of the button when it is ready (with replaceWith).
+        // However, this only works if the empty div is appended somewhere, so
+        // we here append them into a wrapper, and unwrap them once they have
+        // been replaced.
+        var $tempWrapper = $('<div>');
+        _.each(buttons, function ($button) {
+            $button.appendTo($tempWrapper);
         });
-        var invisible_buttons = buttons_partition[0];
-        var visible_buttons = buttons_partition[1];
-
-        // Get the unfolded buttons according to window size
-        var nb_buttons = [2, 4, 6, 7][config.device.size_class];
-        var unfolded_buttons = visible_buttons.slice(0, nb_buttons).concat(invisible_buttons);
-
-        // Get the folded buttons
-        var folded_buttons = visible_buttons.slice(nb_buttons);
-        if(folded_buttons.length === 1) {
-            unfolded_buttons = buttons;
-            folded_buttons = [];
-        }
-
-        // Toggle class to tell if the button box is full (LESS requirement)
-        var full = (visible_buttons.length > nb_buttons);
-        $result.toggleClass('o_full', full).toggleClass('o_not_full', !full);
-
-        // Add the unfolded buttons
-        _.each(unfolded_buttons, function ($button) {
-            $button.appendTo($result);
-        });
-
-        // Add the dropdown with folded buttons if any
-        if(folded_buttons.length) {
-            $result.append($("<button>", {
-                type: 'button',
-                'class': "btn btn-sm oe_stat_button o_button_more dropdown-toggle",
-                'data-toggle': "dropdown",
-                text: _t("More"),
-            }));
-
-            var $ul = $("<ul>", {'class': "dropdown-menu o_dropdown_more", role: "menu"});
-            _.each(folded_buttons, function ($button) {
-                $('<li>').appendTo($ul).append($button);
+        var defs = this.defs.slice(nextDefIndex);
+        Promise.all(defs).then(function () {
+            buttons = $tempWrapper.children();
+            var buttons_partition = _.partition(buttons, function (button) {
+                return $(button).is('.o_invisible_modifier');
             });
-            $ul.appendTo($result);
-        }
+            var invisible_buttons = buttons_partition[0];
+            var visible_buttons = buttons_partition[1];
+
+            // Get the unfolded buttons according to window size
+            var nb_buttons = self._renderButtonBoxNbButtons();
+            var unfolded_buttons = visible_buttons.slice(0, nb_buttons).concat(invisible_buttons);
+
+            // Get the folded buttons
+            var folded_buttons = visible_buttons.slice(nb_buttons);
+            if (folded_buttons.length === 1) {
+                unfolded_buttons = buttons;
+                folded_buttons = [];
+            }
+
+            // Toggle class to tell if the button box is full (CSS requirement)
+            var full = (visible_buttons.length > nb_buttons);
+            $result.toggleClass('o_full', full).toggleClass('o_not_full', !full);
+
+            // Add the unfolded buttons
+            _.each(unfolded_buttons, function (button) {
+                $(button).appendTo($result);
+            });
+
+            // Add the dropdown with folded buttons if any
+            if (folded_buttons.length) {
+                $result.append(dom.renderButton({
+                    attrs: {
+                        'class': 'oe_stat_button o_button_more dropdown-toggle',
+                        'data-toggle': 'dropdown',
+                    },
+                    text: _t("More"),
+                }));
+
+                var $dropdown = $("<div>", {class: "dropdown-menu o_dropdown_more", role: "menu"});
+                _.each(folded_buttons, function (button) {
+                    $(button).addClass('dropdown-item').appendTo($dropdown);
+                });
+                $dropdown.appendTo($result);
+            }
+        });
 
         this._handleAttributes($result, node);
+        this._registerModifiers(node, this.state, $result);
         return $result;
     },
     /**
-     * @private
-     * @param {Object} node
-     * @returns {FieldWidget}
-     */
-    _renderFieldWidget: function (node) {
-        var name = node.attrs.name;
-        var field = this.state.fields[name];
-
-        var modifiers = JSON.parse(node.attrs.modifiers || "{}");
-        var is_readonly = new Domain(modifiers.readonly).compute(this.field_values);
-        var is_required = field.required || new Domain(modifiers.required).compute(this.field_values);
-        var options = {
-            mode: is_readonly ? 'readonly' : this.mode,
-            required: is_required,
-            idForLabel: this._getIDForLabel(name),
-            viewType: 'form',
-        };
-        var attrs = this.state.fieldsInfo.form[name];
-        var widget = new attrs.Widget(this, name, this.state, options);
-        this.widgets.push(widget);
-        var def = widget.__widgetRenderAndInsert(function () {});
-        if (def.state() === 'pending') {
-            this.defs.push(def);
-        }
-        widget.$el.addClass(FIELD_CLASSES[field.type]);
-        this._handleAttributes(widget.$el, node);
-        this._addFieldClassNames(widget, field);
-
-        return widget;
+    * @private
+    * @returns {integer}
+    */
+    _renderButtonBoxNbButtons: function () {
+        return [2, 2, 4, 6][config.device.size_class] || 7;
     },
     /**
      * @private
@@ -357,13 +462,9 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderGenericTag: function (node) {
-        var $result = $('<' + node.tag + '>');
-        _.each(node.attrs, function (attr, name) {
-            if (name !== 'class' && name !== 'modifiers') {
-                $result.attr(name, attr);
-            }
-        });
+        var $result = $('<' + node.tag + '>', _.omit(node.attrs, 'modifiers'));
         this._handleAttributes($result, node);
+        this._registerModifiers(node, this.state, $result);
         $result.append(_.map(node.children, this._renderNode.bind(this)));
         return $result;
     },
@@ -373,11 +474,27 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderHeaderButton: function (node) {
-        var $button = $('<button>')
-                        .text(node.attrs.string)
-                        .addClass('btn btn-sm btn-default');
+        var $button = viewUtils.renderButtonFromNode(node);
+
+        // Current API of odoo for rendering buttons is "if classes are given
+        // use those on top of the 'btn' and 'btn-{size}' classes, otherwise act
+        // as if 'btn-secondary' class was given". The problem is that, for
+        // header buttons only, we allowed users to only indicate their custom
+        // classes without having to explicitely ask for the 'btn-secondary'
+        // class to be added. We force it so here when no bootstrap btn type
+        // class is found.
+        if ($button.not('.btn-primary, .btn-secondary, .btn-link, .btn-success, .btn-info, .btn-warning, .btn-danger').length) {
+            $button.addClass('btn-secondary');
+        }
+
         this._addOnClickAction($button, node);
         this._handleAttributes($button, node);
+        this._registerModifiers(node, this.state, $button);
+
+        // Display tooltip
+        if (config.isDebug() || node.attrs.help) {
+            this._addButtonTooltip(node, $button);
+        }
         return $button;
     },
     /**
@@ -385,31 +502,18 @@ return BasicRenderer.extend({
      * @param {Object} node
      * @returns {jQueryElement}
      */
-    _renderInnerField: function (node) {
-        var field = this.state.fields[node.attrs.name];
-        var fieldDescr = node.attrs.string || field.string;
-        var hasLabel = !node.attrs.nolabel;
-        var widget = this._renderFieldWidget(node);
-        if (hasLabel) {
-            var $label = $('<label>')
-                            .addClass('o_form_label')
-                            .attr('for', this._getIDForLabel(node.attrs.name))
-                            .text(fieldDescr);
-            var isReadOnly = this.mode === 'readonly' || field.readonly;
-            if (this.state.data.id && !widget.isSet() && isReadOnly) {
-                $label.addClass('o_form_label_empty');
+    _renderHeaderButtons: function (node) {
+        var self = this;
+        var $buttons = $('<div>', {class: 'o_statusbar_buttons'});
+        _.each(node.children, function (child) {
+            if (child.tag === 'button') {
+                $buttons.append(self._renderHeaderButton(child));
             }
-            this._handleAttributes($label, node);
-            return $('<tr>')
-                    .append($('<td class="o_td_label">').append($label))
-                    .append($('<td style="width: 100%">').append(widget.$el));
-        } else {
-            var style = {
-                width: 100/2 + '%'
-            };
-            return $('<tr>')
-                    .append($('<td colspan="1">').css(style).append(widget.$el));
-        }
+            if (child.tag === 'widget') {
+                $buttons.append(self._renderTagWidget(child));
+            }
+        });
+        return $buttons;
     },
     /**
      * @private
@@ -417,66 +521,101 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderInnerGroup: function (node) {
-        var $result = $('<table class="o_group o_inner_group"/>');
+        var self = this;
+        var $result = $('<table/>', {class: 'o_group o_inner_group'});
+        var $tbody = $('<tbody />').appendTo($result);
         this._handleAttributes($result, node);
+        this._registerModifiers(node, this.state, $result);
+
+        var col = parseInt(node.attrs.col, 10) || this.INNER_GROUP_COL;
+
         if (node.attrs.string) {
-            var $sep = $('<tr><td colspan="2" style="width:100%;"><div class="o_horizontal_separator">' + node.attrs.string + '</div></td></tr>');
+            var $sep = $('<tr><td colspan="' + col + '" style="width: 100%;"><div class="o_horizontal_separator">' + node.attrs.string + '</div></td></tr>');
             $result.append($sep);
         }
-        var children = node.children;
-        for (var i = 0; i < children.length; i++) {
-            if (children[i].tag === 'field') {
-                var fieldNodes = [children[i]];
-                if (children[i].attrs.nolabel && children[i+1] &&
-                        children[i+1].tag === 'field' && children[i+1].attrs.nolabel) {
-                    fieldNodes.push(children[i+1]);
-                    i++;
-                }
-                $result.append(this._renderInnerGroupRow(fieldNodes));
-            } else if (children[i].tag === 'label') {
-                var label =  children[i];
-                // If there is a "for" attribute, we expect to have an id concerned in the next node.
-                if (label.attrs.for) {
-                    var linkedNode = children[i+1];
-                    $result = this._renderInnerGroupLabel($result, label, linkedNode);
-                    i++; // Skip the rendering of the next node because we just did it.
-                } else {
-                    $result = this._renderInnerGroupLabel($result, label);
-                }
-            } else {
-                var $td = $('<td colspan="2" style="width:100%;">').append(this._renderNode(children[i]));
-                $result.append($('<tr>').append($td));
+
+        var rows = [];
+        var $currentRow = $('<tr/>');
+        var currentColspan = 0;
+        node.children.forEach(function (child) {
+            if (child.tag === 'newline') {
+                rows.push($currentRow);
+                $currentRow = $('<tr/>');
+                currentColspan = 0;
+                return;
             }
-        }
+
+            var colspan = parseInt(child.attrs.colspan, 10);
+            var isLabeledField = (child.tag === 'field' && child.attrs.nolabel !== '1');
+            if (!colspan) {
+                if (isLabeledField) {
+                    colspan = 2;
+                } else {
+                    colspan = 1;
+                }
+            }
+            var finalColspan = colspan - (isLabeledField ? 1 : 0);
+            currentColspan += colspan;
+
+            if (currentColspan > col) {
+                rows.push($currentRow);
+                $currentRow = $('<tr/>');
+                currentColspan = colspan;
+            }
+
+            var $tds;
+            if (child.tag === 'field') {
+                $tds = self._renderInnerGroupField(child);
+            } else if (child.tag === 'label') {
+                $tds = self._renderInnerGroupLabel(child);
+            } else {
+                if (child.tag === 'div' && child.attrs.class !== undefined && child.attrs.class.includes('o_td_label'))
+                    $tds = $('<td class="o_td_label"/>').append(self._renderNode(child));
+                else
+                    $tds = $('<td/>').append(self._renderNode(child));
+            }
+            if (finalColspan > 1) {
+                $tds.last().attr('colspan', finalColspan);
+            }
+            $currentRow.append($tds);
+        });
+        rows.push($currentRow);
+
+        _.each(rows, function ($tr) {
+            var nonLabelColSize = 100 / (col - $tr.children('.o_td_label').length);
+            _.each($tr.children(':not(.o_td_label)'), function (el) {
+                var $el = $(el);
+                $el.css('width', ((parseInt($el.attr('colspan'), 10) || 1) * nonLabelColSize) + '%');
+            });
+            $tbody.append($tr);
+        });
+
         return $result;
     },
     /**
      * @private
-     * @param {jQueryElement} $result
-     * @param {string} label
-     * @param {Object} linkedNode
+     * @param {Object} node
      * @returns {jQueryElement}
      */
-    _renderInnerGroupLabel: function ($result, label, linkedNode) {
-        var $first = $('<td class="o_td_label">')
-                    .append(this._renderNode(label));
-        var $second = linkedNode ? $('<td>').append(this._renderNode(linkedNode)) : $('<td>');
-        var $tr = $('<tr>').append($first).append($second);
-        return $result.append($tr);
+    _renderInnerGroupField: function (node) {
+        var $el = this._renderFieldWidget(node, this.state);
+        var $tds = $('<td/>').append($el);
+
+        if (node.attrs.nolabel !== '1') {
+            var $labelTd = this._renderInnerGroupLabel(node);
+            $tds = $labelTd.add($tds);
+        }
+
+        return $tds;
     },
     /**
-     * Render a group row, with all the nodes inside.
-     *
      * @private
-     * @param {Object[]} nodes
+     * @param {string} label
      * @returns {jQueryElement}
      */
-    _renderInnerGroupRow: function (nodes) {
-        var $tr = $('<tr>');
-        for (var i = 0; i < nodes.length; i++) {
-            $tr.append(this._renderInnerField(nodes[i]).contents());
-        }
-        return $tr;
+    _renderInnerGroupLabel: function (label) {
+        return $('<td/>', {class: 'o_td_label'})
+            .append(this._renderTagLabel(label));
     },
     /**
      * Render a node, from the arch of the view. It is a generic method, that
@@ -486,7 +625,7 @@ return BasicRenderer.extend({
      *
      * For fields, it will return the $el of the field widget. Note that this
      * method is synchronous, field widgets are instantiated and appended, but
-     * if they are asynchronous, they register their deferred in this.defs, and
+     * if they are asynchronous, they register their promises in this.defs, and
      * the _renderView method will properly wait.
      *
      * @private
@@ -507,21 +646,48 @@ return BasicRenderer.extend({
         return this._renderGenericTag(node);
     },
     /**
+     * Renders a 'group' node, which contains 'group' nodes in its children.
+     *
+     * @param {Object} node]
+     * @returns {JQueryElement}
+     */
+    _renderOuterGroup: function (node) {
+        var self = this;
+        var $result = $('<div/>', {class: 'o_group'});
+        var nbCols = parseInt(node.attrs.col, 10) || this.OUTER_GROUP_COL;
+        var colSize = Math.max(1, Math.round(12 / nbCols));
+        if (node.attrs.string) {
+            var $sep = $('<div/>', {class: 'o_horizontal_separator'}).text(node.attrs.string);
+            $result.append($sep);
+        }
+        $result.append(_.map(node.children, function (child) {
+            if (child.tag === 'newline') {
+                return $('<br/>');
+            }
+            var $child = self._renderNode(child);
+            $child.addClass('o_group_col_' + (colSize * (parseInt(child.attrs.colspan, 10) || 1)));
+            return $child;
+        }));
+        this._handleAttributes($result, node);
+        this._registerModifiers(node, this.state, $result);
+        return $result;
+    },
+    /**
      * @private
      * @param {Object} node
      * @returns {jQueryElement}
      */
     _renderStatButton: function (node) {
-        var $button = $('<button>').addClass('btn btn-sm oe_stat_button');
-        if (node.attrs.icon) {
-            $('<div>')
-                .addClass('fa fa-fw o_button_icon')
-                .addClass(node.attrs.icon)
-                .appendTo($button);
-        }
+        var $button = viewUtils.renderButtonFromNode(node, {
+            extraClass: 'oe_stat_button',
+        });
         $button.append(_.map(node.children, this._renderNode.bind(this)));
+        if (node.attrs.help) {
+            this._addButtonTooltip(node, $button);
+        }
         this._addOnClickAction($button, node);
         this._handleAttributes($button, node);
+        this._registerModifiers(node, this.state, $button);
         return $button;
     },
     /**
@@ -535,10 +701,11 @@ return BasicRenderer.extend({
             'data-toggle': 'tab',
             disable_anchor: 'true',
             href: '#' + page_id,
+            class: 'nav-link',
             role: 'tab',
             text: page.attrs.string,
         });
-        return $('<li>').append($a);
+        return $('<li>', {class: 'nav-item'}).append($a);
     },
     /**
      * @private
@@ -557,17 +724,17 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderTagButton: function (node) {
-        var widget = {
-            node: node,
-            string: (node.attrs.string || '').replace(/_/g, '')
-        };
-        if (node.attrs.icon) {
-            widget.fa_icon = node.attrs.icon.indexOf('fa-') === 0;
-        }
-        var $button = $(qweb.render('WidgetButton', {widget: widget}));
+        var $button = viewUtils.renderButtonFromNode(node);
         $button.append(_.map(node.children, this._renderNode.bind(this)));
         this._addOnClickAction($button, node);
         this._handleAttributes($button, node);
+        this._registerModifiers(node, this.state, $button);
+
+        // Display tooltip
+        if (config.isDebug() || node.attrs.help) {
+            this._addButtonTooltip(node, $button);
+        }
+
         return $button;
     },
     /**
@@ -576,7 +743,7 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderTagField: function (node) {
-        return this._renderFieldWidget(node).$el;
+        return this._renderFieldWidget(node, this.state);
     },
     /**
      * @private
@@ -588,7 +755,8 @@ return BasicRenderer.extend({
         if (node.attrs.class) {
             $result.addClass(node.attrs.class);
         }
-        $result.append(_.map(node.children, this._renderNode.bind(this)));
+        var allNodes = node.children.map(this._renderNode.bind(this));
+        $result.append(allNodes);
         return $result;
     },
     /**
@@ -597,27 +765,13 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderTagGroup: function (node) {
-        var self = this;
         var isOuterGroup = _.some(node.children, function (child) {
             return child.tag === 'group';
         });
         if (!isOuterGroup) {
             return this._renderInnerGroup(node);
         }
-
-        var $result = $('<div class="o_group"/>');
-        var $child;
-        _.each(node.children, function (child) {
-            if (child.tag === 'group') {
-                $child = self._renderInnerGroup(child);
-            } else {
-                $child = self._renderNode(child);
-            }
-            $child.addClass('o_group_col_6');
-            $child.appendTo($result);
-        });
-        this._handleAttributes($result, node);
-        return $result;
+        return this._renderOuterGroup(node);
     },
     /**
      * @private
@@ -627,16 +781,15 @@ return BasicRenderer.extend({
     _renderTagHeader: function (node) {
         var self = this;
         var $statusbar = $('<div>', {class: 'o_form_statusbar'});
-        var $buttons = $('<div>', {class: 'o_statusbar_buttons'});
-        $statusbar.append($buttons);
+        $statusbar.append(this._renderHeaderButtons(node));
         _.each(node.children, function (child) {
-            if (child.tag === 'button') {
-                $buttons.append(self._renderHeaderButton(child));
-            } else if (child.tag === 'field') {
-                var widget = self._renderFieldWidget(child);
-                $statusbar.append(widget.$el);
+            if (child.tag === 'field') {
+                var $el = self._renderFieldWidget(child, self.state);
+                $statusbar.append($el);
             }
         });
+        this._handleAttributes($statusbar, node);
+        this._registerModifiers(node, this.state, $statusbar);
         return $statusbar;
     },
     /**
@@ -645,19 +798,50 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderTagLabel: function (node) {
+        var self = this;
         var text;
+        var fieldName = node.tag === 'label' ? node.attrs.for : node.attrs.name;
         if ('string' in node.attrs) { // allow empty string
             text = node.attrs.string;
-        } else if (node.attrs.for) {
-            text = this.state.fields[node.attrs.for].string;
+        } else if (fieldName) {
+            text = this.state.fields[fieldName].string;
         } else  {
             return this._renderGenericTag(node);
         }
-        var $result = $('<label>')
-                        .addClass('o_form_label')
-                        .attr('for', this._getIDForLabel(node.attrs.for))
-                        .text(text);
-        this._handleAttributes($result, node);
+        var $result = $('<label>', {
+            class: 'o_form_label',
+            for: this._getIDForLabel(fieldName),
+            text: text,
+        });
+        if (node.tag === 'label') {
+            this._handleAttributes($result, node);
+        }
+        var modifiersOptions;
+        if (fieldName) {
+            modifiersOptions = {
+                callback: function (element, modifiers, record) {
+                    var widgets = self.allFieldWidgets[record.id];
+                    var widget = _.findWhere(widgets, {name: fieldName});
+                    if (!widget) {
+                        return; // FIXME this occurs if the widget is created
+                                // after the label (explicit <label/> tag in the
+                                // arch), so this won't work on first rendering
+                                // only on reevaluation
+                    }
+                    element.$el.toggleClass('o_form_label_empty', !!( // FIXME condition is evaluated twice (label AND widget...)
+                        record.data.id
+                        && (modifiers.readonly || self.mode === 'readonly')
+                        && !widget.isSet()
+                    ));
+                },
+            };
+        }
+        // FIXME if the function is called with a <label/> node, the registered
+        // modifiers will be those on this node. Maybe the desired behavior
+        // would be to merge them with associated field node if any... note:
+        // this worked in 10.0 for "o_form_label_empty" reevaluation but not for
+        // "o_invisible_modifier" reevaluation on labels...
+        this._registerModifiers(node, this.state, $result, modifiersOptions);
         return $result;
     },
     /**
@@ -668,32 +852,55 @@ return BasicRenderer.extend({
     _renderTagNotebook: function (node) {
         var self = this;
         var $headers = $('<ul class="nav nav-tabs">');
-        var $pages = $('<div class="tab-content nav nav-tabs">');
-        _.each(node.children, function (child, index) {
+        var $pages = $('<div class="tab-content">');
+        var autofocusTab = -1;
+        // renderedTabs is used to aggregate the generated $headers and $pages
+        // alongside their node, so that their modifiers can be registered once
+        // all tabs have been rendered, to ensure that the first visible tab
+        // is correctly activated
+        var renderedTabs = _.map(node.children, function (child, index) {
             var pageID = _.uniqueId('notebook_page_');
             var $header = self._renderTabHeader(child, pageID);
             var $page = self._renderTabPage(child, pageID);
-            if (index === 0) {
-                $header.addClass('active');
-                $page.addClass('active');
+            if (autofocusTab === -1 && child.attrs.autofocus === 'autofocus') {
+                autofocusTab = index;
             }
-            self._handleAttributes($header, child, function onEvalCallback (attrs) {
-                // if the active tab is invisible, activate the first visible tab instead
-                if (attrs.invisible && $header.hasClass('active')) {
-                    $header.removeClass('active');
-                    $page.removeClass('active');
-                    var $firstVisibleTab = $headers.find('li:not(.o_form_invisible):first()');
-                    $firstVisibleTab.addClass('active');
-                    $pages.find($firstVisibleTab.find('a').attr('href')).addClass('active');
-                }
-            });
+            self._handleAttributes($header, child);
             $headers.append($header);
             $pages.append($page);
+            return {
+                $header: $header,
+                $page: $page,
+                node: child,
+            };
         });
-        return $('<div class="o_notebook">')
+        if (renderedTabs.length) {
+            var tabToFocus = renderedTabs[Math.max(0, autofocusTab)];
+            tabToFocus.$header.find('.nav-link').addClass('active');
+            tabToFocus.$page.addClass('active');
+        }
+        // register the modifiers for each tab
+        _.each(renderedTabs, function (tab) {
+            self._registerModifiers(tab.node, self.state, tab.$header, {
+                callback: function (element, modifiers) {
+                    // if the active tab is invisible, activate the first visible tab instead
+                    var $link = element.$el.find('.nav-link');
+                    if (modifiers.invisible && $link.hasClass('active')) {
+                        $link.removeClass('active');
+                        tab.$page.removeClass('active');
+                        var $firstVisibleTab = $headers.find('li:not(.o_invisible_modifier):first() > a');
+                        $firstVisibleTab.addClass('active');
+                        $pages.find($firstVisibleTab.attr('href')).addClass('active');
+                    }
+                },
+            });
+        });
+        var $notebook = $('<div class="o_notebook">')
                 .data('name', node.attrs.name || '_default_')
-                .append($headers)
-                .append($pages);
+                .append($headers, $pages);
+        this._registerModifiers(node, this.state, $notebook);
+        this._handleAttributes($notebook, node);
+        return $notebook;
     },
     /**
      * @private
@@ -701,7 +908,10 @@ return BasicRenderer.extend({
      * @returns {jQueryElement}
      */
     _renderTagSeparator: function (node) {
-        return $('<div/>').addClass('o_horizontal_separator').text(node.attrs.string);
+        var $separator = $('<div/>').addClass('o_horizontal_separator').text(node.attrs.string);
+        this._handleAttributes($separator, node);
+        this._registerModifiers(node, this.state, $separator);
+        return $separator;
     },
     /**
      * @private
@@ -710,52 +920,107 @@ return BasicRenderer.extend({
      */
     _renderTagSheet: function (node) {
         this.has_sheet = true;
-        var $result = $('<div>').addClass('o_form_sheet_bg');
-        var $sheet = $('<div>').addClass('o_form_sheet');
-        $sheet.append(_.map(node.children, this._renderNode.bind(this)));
-        $result.append($sheet);
-        return $result;
+        var $sheet = $('<div>', {class: 'clearfix o_form_sheet'});
+        $sheet.append(node.children.map(this._renderNode.bind(this)));
+        return $sheet;
+    },
+    /**
+     * Instantiate custom widgets
+     *
+     * @private
+     * @param {Object} node
+     * @returns {jQueryElement}
+     */
+    _renderTagWidget: function (node) {
+        return this._renderWidget(this.state, node);
     },
     /**
      * Main entry point for the rendering.  From here, we call _renderNode on
-     * the root of the arch, then, when every deferred (from the field widgets)
+     * the root of the arch, then, when every promise (from the field widgets)
      * are done, it will resolves itself.
      *
      * @private
      * @override method from BasicRenderer
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     _renderView: function () {
         var self = this;
-        this.defs = [];
-        this.nodeModifiers = [];
 
         // render the form and evaluate the modifiers
+        var defs = [];
+        this.defs = defs;
         var $form = this._renderNode(this.arch).addClass(this.className);
-        this._evaluateModifiers();
-
-        var defs = this.defs;
         delete this.defs;
-        return $.when.apply($, defs).then(function () {
-            self.$el.html($form.contents());
 
-            // necessary to allow all sub widgets to use their dimensions in layout
-            // related activities, such as autoresize on fieldtexts
-            core.bus.trigger('DOM_updated');
-
-            self.$el.toggleClass('o_form_nosheet', !self.has_sheet);
-            self.$el.toggleClass('o_form_editable', self.mode === 'edit');
-            self.$el.toggleClass('o_form_readonly', self.mode === 'readonly');
-            // Attach the tooltips on the fields' label
-            _.each(self.widgets, function (widget) {
-                if (core.debug || widget.attrs.help || widget.field.help) {
-                    var idForLabel = self.idsForLabels[widget.name];
-                    var $label = idForLabel ? self.$('label[for=' + idForLabel + ']') : $();
-                    self._addFieldTooltip(widget, $label);
-                }
-            });
-
+        return Promise.all(defs).then(function () {
+            self._updateView($form.contents());
+            if (self.state.res_id in self.alertFields) {
+                self.displayTranslationAlert();
+            }
+        }).then(function(){
+            if (self.lastActivatedFieldIndex >= 0) {
+                self._activateNextFieldWidget(self.state, self.lastActivatedFieldIndex);
+            }
+            if (self._isInDom) {
+                _.forEach(self.allFieldWidgets, function (widgets){
+                    _.invoke(widgets, 'on_attach_callback');
+                });
+            }
+        }).guardedCatch(function () {
+            $form.remove();
         });
+    },
+    /**
+     * Updates the form's $el with new content.
+     *
+     * @private
+     * @see _renderView
+     * @param {JQuery} $newContent
+     */
+    _updateView: function ($newContent) {
+        var self = this;
+
+        // Set the new content of the form view, and toggle classnames
+        this.$el.html($newContent);
+        this.$el.toggleClass('o_form_nosheet', !this.has_sheet);
+        if (this.has_sheet) {
+            this.$el.children().not('.oe_chatter')
+                .wrapAll($('<div/>', {class: 'o_form_sheet_bg'}));
+        }
+        this.$el.toggleClass('o_form_editable', this.mode === 'edit');
+        this.$el.toggleClass('o_form_readonly', this.mode === 'readonly');
+
+        // Attach the tooltips on the fields' label
+        _.each(this.allFieldWidgets[this.state.id], function (widget) {
+            var idForLabel = self.idsForLabels[widget.name];
+            // We usually don't support multiple widgets for the same field on the
+            // same view but it is the case with the new settings view on V11.0.
+            // Therefore, we need to retrieve the correct label since it could be
+            // displayed multiple times on the view, otherwise, for example the
+            // enterprise label will be displayed as many times as the field
+            // exists on settings.
+            var $widgets = self.$('.o_field_widget[name=' + widget.name + ']');
+            var $label = idForLabel ? self.$('.o_form_label[for=' + idForLabel + ']') : $();
+            $label = $label.eq($widgets.index(widget.$el));
+            if (config.isDebug() || widget.attrs.help || widget.field.help) {
+                self._addFieldTooltip(widget, $label);
+            }
+            if (widget.attrs.widget === 'upgrade_boolean') {
+                // this widget needs a reference to its $label to be correctly
+                // rendered
+                widget.renderWithLabel($label);
+            }
+        });
+    },
+    /**
+     * Sets id attribute of given widget to idForLabel
+     *
+     * @private
+     * @param {AbstractField} widget
+     * @param {idForLabel} string
+     */
+    _setIDForLabel: function (widget, idForLabel) {
+        widget.setIDForLabel(idForLabel);
     },
 
     //--------------------------------------------------------------------------
@@ -763,34 +1028,70 @@ return BasicRenderer.extend({
     //--------------------------------------------------------------------------
 
     /**
-     * When someone presses TAB in a widget, it is nice to be able to go to the
-     * next widget, especially since the TAB key event is preventDefaulted
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onActivateNextWidget: function (ev) {
+        ev.stopPropagation();
+        var index = this.allFieldWidgets[this.state.id].indexOf(ev.data.target);
+        this._activateNextFieldWidget(this.state, index);
+    },
+    /**
+     * Makes the Edit button bounce in readonly
      *
      * @private
-     * @param {OdooEvent} event
      */
-    _onMoveNext: function (event) {
-        event.stopPropagation();
-        var index = this.widgets.indexOf(event.target);
-        if (index + 1 < this.widgets.length) {
-            this.widgets[index + 1].activate();
+    _onClick: function () {
+        if (this.mode === 'readonly') {
+            this.trigger_up('bounce_edit');
         }
     },
     /**
-     * When someone presses SHIFT+TAB in a widget, it is nice to be able to go
-     * back to the previous widget, especially since the TAB key event is
-     * preventDefaulted
+     * @override
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onNavigationMove: function (ev) {
+        ev.stopPropagation();
+        var index;
+        if (ev.data.direction === "next") {
+            index = this.allFieldWidgets[this.state.id].indexOf(ev.data.target || ev.target);
+            this._activateNextFieldWidget(this.state, index);
+        } else if (ev.data.direction === "previous") {
+            index = this.allFieldWidgets[this.state.id].indexOf(ev.data.target);
+            this._activatePreviousFieldWidget(this.state, index);
+        }
+    },
+    /**
+     * Listen to notebook tab changes and trigger a DOM_updated event such that
+     * widgets in the visible tab can correctly compute their dimensions (e.g.
+     * autoresize on field text)
      *
      * @private
-     * @param {OdooEvent} event
      */
-    _onMovePrevious: function (event) {
-        event.stopPropagation();
-        var index = this.widgets.indexOf(event.target);
-        if (index >= 1) {
-            this.widgets[index - 1].activate();
-        }
+    _onNotebookTabChanged: function () {
+        core.bus.trigger('DOM_updated');
+    },
+    /**
+     * open the translation view for the current field
+     *
+     * @private
+     * @param {MouseEvent} ev
+     */
+    _onTranslate: function (ev) {
+        ev.preventDefault();
+        this.trigger_up('translate', {fieldName: ev.target.name, id: this.state.id});
+    },
+    /**
+     * remove alert fields of record from alertFields object
+     *
+     * @private
+     * @param {MouseEvent} ev
+     */
+    _onTranslateNotificationClose: function(ev) {
+        delete this.alertFields[this.state.res_id];
     },
 });
 
+return FormRenderer;
 });

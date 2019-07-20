@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
+        <menuitem id="crm_menu_resellers" name="Resellers" parent="crm.crm_menu_config" sequence="16"/>
+
         <!--Partner Activation -->
 
         <record model="ir.ui.view" id="res_partner_activation_form">
@@ -8,10 +10,12 @@
             <field name="model">res.partner.activation</field>
             <field name="arch" type="xml">
                 <form string="Activation">
-                    <group col="4">
-                        <field name="name" />
-                        <field name="sequence" />
-                    </group>
+                    <sheet>
+                        <group col="4">
+                            <field name="name" />
+                            <field name="sequence" />
+                        </group>
+                    </sheet>
                 </form>
             </field>
         </record>
@@ -19,8 +23,9 @@
             <field name="name">res.partner.activation.tree</field>
             <field name="model">res.partner.activation</field>
             <field name="arch" type="xml">
-                <tree string="Activation">
-                    <field name="name" />
+                <tree string="Activation" editable="bottom">
+                    <field name="sequence" widget="handle"/>
+                    <field name="name"/>
                 </tree>
             </field>
         </record>
@@ -28,11 +33,10 @@
         <record model="ir.actions.act_window" id="res_partner_activation_act">
             <field name="name">Partner Activations</field>
             <field name="res_model">res.partner.activation</field>
-            <field name="view_type">form</field>
             <field name="view_mode">tree,form</field>
         </record>
 
-        <menuitem id="res_partner_activation_config_mi" parent="sales_team.menu_localisation" action="res_partner_activation_act" groups="base.group_no_one"
+        <menuitem id="res_partner_activation_config_mi" parent="crm_menu_resellers" action="res_partner_activation_act"
             sequence="6"/>
 
     <!--Partner Level -->
@@ -56,7 +60,7 @@
                     <div class="oe_button_box" name="button_box">
                         <button class="oe_stat_button" name="website_publish_button"
                                 type="object" icon="fa-globe">
-                            <field name="website_published" widget="website_button"/>
+                            <field name="is_published" widget="website_button"/>
                         </button>
                     </div>
                     <div class="oe_title">
@@ -77,11 +81,9 @@
     <record id="res_partner_grade_action" model="ir.actions.act_window">
         <field name="name">Partner Level</field>
         <field name="res_model">res.partner.grade</field>
-        <field name="view_type">form</field>
     </record>
     <menuitem action="res_partner_grade_action" id="menu_res_partner_grade_action"
-        groups="base.group_no_one"
-        parent="sales_team.menu_localisation"
+        parent="crm_menu_resellers"
         sequence="5" />
 
     <!-- Partner form -->
@@ -104,7 +106,7 @@
         <field name="inherit_id" ref="base.view_res_partner_filter"/>
         <field name="arch" type="xml">
             <filter name="salesperson" position="after">
-                <filter string="Activation" context="{'group_by' : 'activation'}" domain="[]"/>
+                <filter string="Activation" name="activation" context="{'group_by' : 'activation'}" domain="[]"/>
             </filter>
             <field name="category_id" position="after">
                 <field name="grade_id"/>
@@ -135,7 +137,7 @@
                     </group>
                 </xpath>
                 <xpath expr="//group[@name='sale']" position="inside">
-                    <field name="assigned_partner_id" groups="base.group_no_one"/>
+                    <field name="assigned_partner_id" groups="base.group_no_one" attrs="{'invisible': [('customer','=', False)]}"/>
                 </xpath>
             </data>
         </field>

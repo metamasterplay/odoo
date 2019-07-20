@@ -7,30 +7,43 @@ odoo.define('web.AbstractRenderer', function (require) {
  *
  */
 
-var Widget = require('web.Widget');
+var mvc = require('web.mvc');
 
-return Widget.extend({
+/**
+ * @class AbstractRenderer
+ */
+return mvc.Renderer.extend({
     /**
-     * @constructor
-     * @param {Widget} parent
-     * @param {any} state
-     * @param {Object} params
+     * @override
+     * @param {string} [params.noContentHelp]
      */
     init: function (parent, state, params) {
-        this._super(parent);
-        this.state = state;
+        this._super.apply(this, arguments);
         this.arch = params.arch;
+        this.noContentHelp = params.noContentHelp;
+        this.withSearchPanel = params.withSearchPanel;
     },
     /**
-     * The rendering can be asynchronous (but it is not encouraged). The start
+     * The rendering is asynchronous. The start
      * method simply makes sure that we render the view.
      *
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     start: function () {
         this.$el.addClass(this.arch.attrs.class);
-        return $.when(this._render(), this._super());
+        if (this.withSearchPanel) {
+            this.$el.addClass('o_renderer_with_searchpanel');
+        }
+        return Promise.all([this._render(), this._super()]);
     },
+    /**
+     * Called each time the renderer is attached into the DOM.
+     */
+    on_attach_callback: function () {},
+    /**
+     * Called each time the renderer is detached from the DOM.
+     */
+    on_detach_callback: function () {},
 
     //--------------------------------------------------------------------------
     // Public
@@ -54,6 +67,11 @@ return Widget.extend({
     getLocalState: function () {
     },
     /**
+     * Order to focus to be given to the content of the current view
+     */
+    giveFocus: function () {
+    },
+    /**
      * This is the reverse operation from getLocalState.  With this method, we
      * expect the renderer to restore all DOM state, if it is relevant.
      *
@@ -65,15 +83,18 @@ return Widget.extend({
     setLocalState: function (localState) {
     },
     /**
-     * update the state of the view.  It always retrigger a full rerender.
+     * Updates the state of the view. It retriggers a full rerender, unless told
+     * otherwise (for optimization for example).
      *
      * @param {any} state
      * @param {Object} params
-     * @returns {Deferred}
+     * @param {boolean} [params.noRender=false]
+     *        if true, the method only updates the state without rerendering
+     * @returns {Promise}
      */
     updateState: function (state, params) {
         this.state = state;
-        return this._render();
+        return params.noRender ? Promise.resolve() : this._render();
     },
 
     //--------------------------------------------------------------------------
@@ -85,12 +106,11 @@ return Widget.extend({
      *
      * @abstract
      * @private
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     _render: function () {
-        return $.when();
+        return Promise.resolve();
     },
 });
 
 });
-

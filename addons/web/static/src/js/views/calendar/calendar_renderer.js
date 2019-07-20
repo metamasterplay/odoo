@@ -2,15 +2,16 @@ odoo.define('web.CalendarRenderer', function (require) {
 "use strict";
 
 var AbstractRenderer = require('web.AbstractRenderer');
-var relational_fields = require('web.relational_fields');
-var FieldManagerMixin = require('web.FieldManagerMixin');
-var field_utils = require('web.field_utils');
-var session = require('web.session');
-var Dialog = require('web.Dialog');
-var Widget = require('web.Widget');
-var utils = require('web.utils');
+var config = require('web.config');
 var core = require('web.core');
+var Dialog = require('web.Dialog');
+var field_utils = require('web.field_utils');
+var FieldManagerMixin = require('web.FieldManagerMixin');
 var QWeb = require('web.QWeb');
+var relational_fields = require('web.relational_fields');
+var session = require('web.session');
+var utils = require('web.utils');
+var Widget = require('web.Widget');
 
 var _t = core._t;
 var qweb = core.qweb;
@@ -58,6 +59,9 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
         this.label = options.label;
         this.getColor = options.getColor;
     },
+    /**
+     * @override
+     */
     willStart: function () {
         var self = this;
         var defs = [this._super.apply(this, arguments)];
@@ -73,14 +77,20 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
                     self.model.get(recordID),
                     {
                         mode: 'edit',
-                        can_create: false,
+                        attrs: {
+                            placeholder: _.str.sprintf(_t("Add %s"), self.title),
+                            can_create: false
+                        },
                     });
             });
             defs.push(def);
         }
-        return $.when.apply($, defs);
+        return Promise.all(defs);
 
     },
+    /**
+     * @override
+     */
     start: function () {
         this._super();
         if (this.many2one) {
@@ -88,7 +98,7 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
             this.many2one.filter_ids = _.without(_.pluck(this.filters, 'value'), 'all');
         }
         this.$el.on('click', '.o_remove', this._onFilterRemove.bind(this));
-        this.$el.on('click', '.o_checkbox input', this._onFilterActive.bind(this));
+        this.$el.on('click', '.custom-checkbox input', this._onFilterActive.bind(this));
     },
 
     //--------------------------------------------------------------------------
@@ -96,16 +106,19 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
     //--------------------------------------------------------------------------
 
     /**
+     * @private
      * @param {OdooEvent} event
      */
     _onFieldChanged: function (event) {
         var self = this;
         event.stopPropagation();
+        var createValues = {'user_id': session.uid};
         var value = event.data.changes[this.write_field].id;
+        createValues[this.write_field] = value;
         this._rpc({
                 model: this.write_model,
                 method: 'create',
-                args: [{'user_id': session.uid,'partner_id': value,}],
+                args: [createValues],
             })
             .then(function () {
                 self.trigger_up('changeFilter', {
@@ -115,6 +128,10 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
                 });
             });
     },
+    /**
+     * @private
+     * @param {MouseEvent} e
+     */
     _onFilterActive: function (e) {
         var $input = $(e.currentTarget);
         this.trigger_up('changeFilter', {
@@ -124,6 +141,7 @@ var SidebarFilter = Widget.extend(FieldManagerMixin, {
         });
     },
     /**
+     * @private
      * @param {MouseEvent} e
      */
     _onFilterRemove: function (e) {
@@ -164,21 +182,25 @@ return AbstractRenderer.extend({
     init: function (parent, state, params) {
         this._super.apply(this, arguments);
         this.displayFields = params.displayFields;
+        this.model = params.model;
         this.filters = [];
         this.color_map = {};
 
         if (params.eventTemplate) {
-            this.qweb = new QWeb(session.debug, {_s: session.origin});
+            this.qweb = new QWeb(config.isDebug(), {_s: session.origin});
             this.qweb.add_template(utils.json_node_to_xml(params.eventTemplate));
         }
     },
     /**
      * @override
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     start: function () {
         this._initSidebar();
         this._initCalendar();
+        if (config.device.isMobile) {
+            this._bindSwipe();
+        }
         return this._super();
     },
     /**
@@ -190,6 +212,7 @@ return AbstractRenderer.extend({
         }
         if (this.$small_calendar) {
             this.$small_calendar.datepicker('destroy');
+            $('#ui-datepicker-div:empty').remove();
         }
         this._super.apply(this, arguments);
     },
@@ -250,11 +273,51 @@ return AbstractRenderer.extend({
         this.color_map[key] = index;
         return index;
     },
+    /**
+     * @override
+     */
+    getLocalState: function () {
+        var $fcScroller = this.$calendar.find('.fc-scroller');
+        return {
+            scrollPosition: $fcScroller.scrollTop(),
+        };
+    },
+    /**
+     * @override
+     */
+    setLocalState: function (localState) {
+        if (localState.scrollPosition) {
+            var $fcScroller = this.$calendar.find('.fc-scroller');
+            $fcScroller.scrollTop(localState.scrollPosition);
+        }
+    },
 
     //--------------------------------------------------------------------------
     // Private
     //--------------------------------------------------------------------------
 
+    /**
+     * @private
+     * Bind handlers to enable swipe navigation
+     *
+     * @private
+     */
+    _bindSwipe: function () {
+        var self = this;
+        var touchStartX;
+        var touchEndX;
+        this.$calendar.on('touchstart', function (event) {
+            touchStartX = event.originalEvent.touches[0].pageX;
+        });
+        this.$calendar.on('touchend', function (event) {
+            touchEndX = event.originalEvent.changedTouches[0].pageX;
+            if (touchStartX - touchEndX > 100) {
+                self.trigger_up('next');
+            } else if (touchStartX - touchEndX < -100) {
+                self.trigger_up('prev');
+            }
+        });
+    },
     /**
      * @param {any} event
      * @returns {string} the html for the rendered event
@@ -262,12 +325,13 @@ return AbstractRenderer.extend({
     _eventRender: function (event) {
         var qweb_context = {
             event: event,
-            record: event.record,
-            widget: this,
-            read_only_mode: this.read_only_mode,
-            user_context: session.user_context,
+            fields: this.state.fields,
             format: this._format.bind(this),
-            fields: this.state.fields
+            isMobile: config.device.isMobile,
+            read_only_mode: this.read_only_mode,
+            record: event.record,
+            user_context: session.user_context,
+            widget: this,
         };
         this.qweb_context = qweb_context;
         if (_.isEmpty(qweb_context.record)) {
@@ -277,21 +341,33 @@ return AbstractRenderer.extend({
         }
     },
     /**
+     * @private
      * @param {any} record
      * @param {any} fieldName
      * @returns {string}
      */
     _format: function (record, fieldName) {
         var field = this.state.fields[fieldName];
-        return field_utils.format[field.type](record[fieldName], field);
+        if (field.type === "one2many" || field.type === "many2many") {
+            return field_utils.format[field.type]({data: record[fieldName]}, field);
+        } else {
+            return field_utils.format[field.type](record[fieldName], field, {forceString: true});
+        }
     },
     /**
      * Initialize the main calendar
+     *
+     * @private
      */
     _initCalendar: function () {
         var self = this;
 
         this.$calendar = this.$(".o_calendar_widget");
+
+        // This seems like a workaround but apparently passing the locale
+        // in the options is not enough. We should initialize it beforehand
+        var locale = moment.locale();
+        $.fullCalendar.locale(locale);
 
         //Documentation here : http://arshaw.com/fullcalendar/docs/
         var fc_options = $.extend({}, this.state.fc_options, {
@@ -306,7 +382,11 @@ return AbstractRenderer.extend({
                 self.$calendar.fullCalendar('unselect');
             },
             select: function (target_date, end_date, event, _js_event, _view) {
-                self.trigger_up('openCreate', {'start': target_date, 'end': end_date});
+                var data = {'start': target_date, 'end': end_date};
+                if (self.state.context.default_name) {
+                    data.title = self.state.context.default_name;
+                }
+                self.trigger_up('openCreate', data);
                 self.$calendar.fullCalendar('unselect');
             },
             eventRender: function (event, element) {
@@ -316,22 +396,40 @@ return AbstractRenderer.extend({
                 element.addClass($render.attr('class'));
                 var display_hour = '';
                 if (!event.allDay) {
-                    display_hour = (event.start.format('HH:mm') === '00:00' ? event.r_start.format('HH:mm') : event.start.format('HH:mm')) + ' - ' +
-                        (event.end && event.end.format('HH:mm') !== '00:00' ? event.end.format('HH:mm') : event.r_end.format('HH:mm'));
+                    var start = event.r_start || event.start;
+                    var end = event.r_end || event.end;
+                    var timeFormat = _t.database.parameters.time_format.search("%H") != -1 ? 'HH:mm': 'h:mma';
+                    display_hour = start.format(timeFormat) + ' - ' + end.format(timeFormat);
                     if (display_hour === '00:00 - 00:00') {
-                        display_hour = _t('All the day');
+                        display_hour = _t('All day');
                     }
                 }
                 element.find('.fc-content .fc-time').text(display_hour);
             },
-
+            // Dirty hack to ensure a correct first render
+            eventAfterAllRender: function () {
+                $(window).trigger('resize');
+            },
+            viewRender: function (view) {
+                // compute mode from view.name which is either 'month', 'agendaWeek' or 'agendaDay'
+                var mode = view.name === 'month' ? 'month' : (view.name === 'agendaWeek' ? 'week' : 'day');
+                self.trigger_up('viewUpdated', {
+                    mode: mode,
+                    title: view.title,
+                });
+            },
+            height: 'parent',
             unselectAuto: false,
+            isRTL: _t.database.parameters.direction === "rtl",
+            locale: locale, // reset locale when fullcalendar has already been instanciated before now
         });
 
         this.$calendar.fullCalendar(fc_options);
     },
     /**
      * Initialize the mini calendar in the sidebar
+     *
+     * @private
      */
     _initCalendarMini: function () {
         var self = this;
@@ -349,6 +447,8 @@ return AbstractRenderer.extend({
     },
     /**
      * Initialize the sidebar
+     *
+     * @private
      */
     _initSidebar: function () {
         this.$sidebar = this.$('.o_calendar_sidebar');
@@ -359,12 +459,14 @@ return AbstractRenderer.extend({
      * Render the calendar view, this is the main entry point.
      *
      * @override method from AbstractRenderer
-     * @returns {Deferred}
+     * @private
+     * @returns {Promise}
      */
     _render: function () {
         var $calendar = this.$calendar;
         var $fc_view = $calendar.find('.fc-view');
         var scrollPosition = $fc_view.scrollLeft();
+        var scrollTop = this.$calendar.find('.fc-scroller').scrollTop();
 
         $fc_view.scrollLeft(0);
         $calendar.fullCalendar('unselect');
@@ -377,11 +479,6 @@ return AbstractRenderer.extend({
             $calendar.fullCalendar('gotoDate', moment(this.state.target_date));
             this.target_date = this.state.target_date.toString();
         }
-
-        var highlightDate = moment(this.state.highlight_date).format('YYYY-MM-DD');
-        $calendar.find('.o_target_date').removeClass('o_target_date');
-        $calendar.find('.fc-bg .fc-day[data-date="'+highlightDate+'"]')
-                 .addClass('o_target_date');
 
         this.$small_calendar.datepicker("setDate", this.state.highlight_date.toDate())
                             .find('.o_selected_range')
@@ -407,16 +504,22 @@ return AbstractRenderer.extend({
         this.$sidebar_container.toggleClass('o_sidebar_hidden', fullWidth);
         this.$sidebar.toggleClass('o_hidden', fullWidth);
 
-        this._renderFilters();
+        var filterProm = this._renderFilters();
         this.$calendar.appendTo('body');
-        this.$calendar.fullCalendar('render');
+        if (scrollTop) {
+            this.$calendar.fullCalendar('reinitView');
+        } else {
+            this.$calendar.fullCalendar('render');
+        }
         this._renderEvents();
         this.$calendar.prependTo(this.$('.o_calendar_view'));
 
-        return this._super.apply(this, arguments);
+        return Promise.all([filterProm, this._super.apply(this, arguments)]);
     },
     /**
      * Render all events
+     *
+     * @private
      */
     _renderEvents: function () {
         this.$calendar.fullCalendar('removeEvents');
@@ -424,25 +527,49 @@ return AbstractRenderer.extend({
     },
     /**
      * Render all filters
+     *
+     * @private
+     * @returns {Promise} resolved when all filters have been rendered
      */
     _renderFilters: function () {
-        var self = this;
         _.each(this.filters || (this.filters = []), function (filter) {
             filter.destroy();
         });
         if (this.state.fullWidth) {
             return;
         }
-        _.each(this.state.filters, function (options) {
+        return this._renderFiltersOneByOne();
+    },
+    /**
+     * Renders each filter one by one, waiting for the first filter finished to
+     * be rendered and appended to render the next one.
+     * We need to do like this since render a filter is asynchronous, we don't
+     * know which one will be appened at first and we want tp force them to be
+     * rendered in order.
+     *
+     * @param {number} filterIndex if not set, 0 by default
+     * @returns {Promise} resolved when all filters have been rendered
+     */
+    _renderFiltersOneByOne: function (filterIndex) {
+        filterIndex = filterIndex || 0;
+        var arrFilters = _.toArray(this.state.filters);
+        var prom;
+        if (filterIndex < arrFilters.length) {
+            var options = arrFilters[filterIndex];
             if (!_.find(options.filters, function (f) {return f.display == null || f.display;})) {
                 return;
             }
-            options.getColor = self.getColor.bind(self);
-            options.fields = self.state.fields;
+
+            var self = this;
+            options.getColor = this.getColor.bind(this);
+            options.fields = this.state.fields;
             var filter = new SidebarFilter(self, options);
-            filter.appendTo(self.$sidebar);
-            self.filters.push(filter);
-        });
+            prom = filter.appendTo(this.$sidebar).then(function () {
+                return self._renderFiltersOneByOne(filterIndex + 1);
+            });
+            this.filters.push(filter);
+        }
+        return Promise.resolve(prom);
     },
 
     //--------------------------------------------------------------------------
@@ -451,6 +578,8 @@ return AbstractRenderer.extend({
 
     /**
      * Toggle the sidebar
+     *
+     * @private
      */
     _onToggleSidebar: function () {
         this.trigger_up('toggleFullWidth');

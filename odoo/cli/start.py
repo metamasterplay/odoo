@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 import argparse
 import glob
 import itertools
 import os
 import sys
 
+import odoo
 from . import Command
 from .server import main
 from odoo.modules.module import get_module_root, MANIFEST_NAMES
@@ -35,6 +37,9 @@ class Start(Command):
 
         args, unknown = parser.parse_known_args(args=cmdargs)
 
+        # When in a virtualenv, by default use it's path rather than the cwd
+        if args.path == '.' and os.environ.get('VIRTUAL_ENV'):
+            args.path = os.environ.get('VIRTUAL_ENV')
         project_path = os.path.abspath(os.path.expanduser(os.path.expandvars(args.path)))
         module_root = get_module_root(project_path)
         db_name = None
@@ -56,6 +61,7 @@ class Start(Command):
         # TODO: forbid some database names ? eg template1, ...
         try:
             _create_empty_database(args.db_name)
+            odoo.tools.config['init']['base'] = True
         except DatabaseExists as e:
             pass
         except Exception as e:
@@ -74,5 +80,5 @@ class Start(Command):
         main(cmdargs)
 
 def die(message, code=1):
-    print >>sys.stderr, message
+    print(message, file=sys.stderr)
     sys.exit(code)

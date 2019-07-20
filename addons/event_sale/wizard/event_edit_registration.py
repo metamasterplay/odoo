@@ -5,6 +5,7 @@ from odoo import models, fields, api
 
 class RegistrationEditor(models.TransientModel):
     _name = "registration.editor"
+    _description = 'Edit Attendee Details on Sales Confirmation'
 
     sale_order_id = fields.Many2one('sale.order', 'Sales Order', required=True)
     event_registration_ids = fields.One2many('registration.editor.line', 'editor_id', string='Registrations to Edit')
@@ -44,7 +45,6 @@ class RegistrationEditor(models.TransientModel):
         res = self._convert_to_write(res)
         return res
 
-    @api.multi
     def action_make_registration(self):
         self.ensure_one()
         for registration_line in self.event_registration_ids:
@@ -62,6 +62,7 @@ class RegistrationEditor(models.TransientModel):
 class RegistrationEditorLine(models.TransientModel):
     """Event Registration"""
     _name = "registration.editor.line"
+    _description = 'Edit Attendee Line on Sales Confirmation'
 
     editor_id = fields.Many2one('registration.editor')
     sale_order_line_id = fields.Many2one('sale.order.line', string='Sales Order Line')
@@ -72,7 +73,6 @@ class RegistrationEditorLine(models.TransientModel):
     phone = fields.Char(string='Phone')
     name = fields.Char(string='Name', index=True)
 
-    @api.multi
     def get_registration_data(self):
         self.ensure_one()
         return {
